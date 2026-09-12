@@ -1,89 +1,87 @@
 'use client';
 
+import { useState } from 'react';
 import { useNetworkState } from '@/hooks/useNetworkState';
-import { Header } from '@/components/layout/Header';
+import { Header, NavTab } from '@/components/layout/Header';
 import { NetworkGraph } from '@/components/graph/NetworkGraph';
-import { RouteDisplay } from '@/components/graph/RouteDisplay';
+import { NodeInspector } from '@/components/inspector/NodeInspector';
+import { SimulatorDeck } from '@/components/simulator/SimulatorDeck';
+import { ActivityBar } from '@/components/activity/ActivityBar';
 import { EventStream } from '@/components/telemetry/EventStream';
-import { FailureSimulator } from '@/components/simulator/FailureSimulator';
-import { Server, Radio, Database } from 'lucide-react';
 
 export default function Home() {
-  const { nodes, links, activeRoute, internetOnline, logs, metrics, actions } = useNetworkState();
+  const [activeTab, setActiveTab] = useState<NavTab>('network');
+  const {
+    nodes,
+    links,
+    activeRoute,
+    selectedNode,
+    setSelectedNodeId,
+    internetOnline,
+    logs,
+    metrics,
+    transferState,
+    actions
+  } = useNetworkState();
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none">
-      <Header internetOnline={internetOnline} onToggleInternet={actions.toggleInternet} />
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col font-mono select-none">
+      {/* Top Header with Navigation Tabs */}
+      <Header
+        activeTab={activeTab}
+        onTabChange={setActiveTab}
+        internetOnline={internetOnline}
+        onToggleInternet={actions.toggleInternet}
+      />
 
-      <main className="flex-1 p-6 grid grid-cols-12 gap-6 max-w-[1800px] w-full mx-auto">
-        <div className="col-span-3 space-y-4">
-          <div className="grid grid-cols-2 gap-3 font-mono">
-            <div className="bg-slate-900 border border-slate-800 p-3 rounded-lg">
-              <div className="text-slate-500 text-[10px] uppercase flex items-center space-x-1">
-                <Server className="w-3 h-3 text-cyan-400" />
-                <span>Nodes</span>
+      {/* Main Content Area */}
+      <main className="flex-1 p-4 md:p-6 max-w-7xl w-full mx-auto">
+        {/* VIEW 1: TOPOLOGY & SIMULATOR (Live Topology + Controls in Same Viewport) */}
+        {activeTab === 'network' && (
+          <div className="space-y-4">
+            {/* Top Row: Mesh Graph + Dynamic Inspector */}
+            <div className="grid grid-cols-12 gap-4 items-start">
+              <div className="col-span-12 lg:col-span-8">
+                <NetworkGraph
+                  nodes={nodes}
+                  links={links}
+                  activeRoute={activeRoute}
+                  metrics={metrics}
+                  selectedNodeId={selectedNode.id}
+                  onSelectNode={setSelectedNodeId}
+                />
               </div>
-              <div className="text-xl font-bold text-cyan-400 mt-1">
-                {metrics.activeNodes} / {metrics.totalNodes}
+
+              <div className="col-span-12 lg:col-span-4">
+                <NodeInspector node={selectedNode} />
               </div>
             </div>
 
-            <div className="bg-slate-900 border border-slate-800 p-3 rounded-lg">
-              <div className="text-slate-500 text-[10px] uppercase flex items-center space-x-1">
-                <Radio className="w-3 h-3 text-emerald-400" />
-                <span>Latency</span>
-              </div>
-              <div className="text-xl font-bold text-emerald-400 mt-1">
-                {metrics.avgMeshLatencyMs} ms
-              </div>
-            </div>
+            {/* Bottom Row: Chaos Simulator Controls (Directly updates topology above) */}
+            <SimulatorDeck
+              nodes={nodes}
+              activeRoute={activeRoute}
+              internetOnline={internetOnline}
+              onToggleInternet={actions.toggleInternet}
+              onKillNode={actions.killNode}
+              onRestoreNode={actions.restoreNode}
+              onResetNetwork={actions.resetNetwork}
+            />
           </div>
+        )}
 
-          <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 font-mono">
-            <h2 className="text-xs font-bold text-slate-400 uppercase mb-3 flex items-center justify-between">
-              <span>Discovered Nodes</span>
-              <Database className="w-3.5 h-3.5 text-slate-500" />
-            </h2>
-            <div className="space-y-2">
-              {nodes.map(node => (
-                <div
-                  key={node.id}
-                  className="flex items-center justify-between p-2 rounded bg-slate-950 border border-slate-800/80 text-xs"
-                >
-                  <div>
-                    <div className="font-bold text-slate-200">{node.label}</div>
-                    <div className="text-[10px] text-slate-500">{node.ip}</div>
-                  </div>
-                  <span
-                    className={`text-[10px] px-2 py-0.5 rounded font-bold ${
-                      node.status === 'OFFLINE'
-                        ? 'bg-red-950 text-red-400 border border-red-800'
-                        : 'bg-emerald-950 text-emerald-400 border border-emerald-800'
-                    }`}
-                  >
-                    {node.status}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        <div className="col-span-6 space-y-4">
-          <RouteDisplay activeRoute={activeRoute} />
-          <NetworkGraph nodes={nodes} links={links} activeRoute={activeRoute} />
-          <FailureSimulator
-            onTriggerNodeC={actions.triggerNodeCFailure}
-            onToggleInternet={actions.toggleInternet}
-            onReset={actions.resetNetwork}
-            internetOnline={internetOnline}
-            isNodeCOffline={nodes.find(n => n.id === 'NODE_C')?.status === 'OFFLINE'}
+        {/* VIEW 2: TRANSFERS (P2P Message & File Chunk Injection) */}
+        {activeTab === 'transfers' && (
+          <ActivityBar
+            onSendMessage={() => actions.sendTransfer('MESSAGE')}
+            onSendFile={() => actions.sendTransfer('FILE')}
+            transferState={transferState}
+            nodes={nodes}
           />
-        </div>
+        )}
 
-        <div className="col-span-3">
-          <EventStream logs={logs} />
-        </div>
+        {/* VIEW 3: AUDIT LOGS (Real-time Event Stream) */}
+        {activeTab === 'logs' && <EventStream logs={logs} />}
       </main>
     </div>
   );
