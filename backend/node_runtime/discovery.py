@@ -174,6 +174,25 @@ class DiscoveryService:
         return self.local_ip()
 
     def _announcement(self) -> dict:
+        # Gossip: share online peers (up to 32) so the whole mesh
+        # learns every node transitively (C becomes visible to A via
+        # B even when A never hears C's own broadcast).
+        gossip = []
+
+        for peer_id, (ip, port) in list(self.peers.items())[:64]:
+            # Never gossip provisional static-peer placeholders; only
+            # confirmed identities travel.
+            if peer_id.startswith("peer-"):
+                continue
+
+            node = self.registry.get(peer_id)
+
+            if node is not None and node.is_online():
+                gossip.append([peer_id, ip, port])
+
+            if len(gossip) >= 32:
+                break
+
         return {
             "packet_type": "DISCOVERY",
             "node_id": self.node_id,
@@ -182,6 +201,7 @@ class DiscoveryService:
             "api_port": self.api_port,
             "timestamp": time(),
             "protocol_version": PROTOCOL_VERSION,
+            "peers": gossip,
         }
 
     async def _announce_loop(self) -> None:
@@ -304,6 +324,38 @@ class DiscoveryService:
 
         self.register_peer(node_id, ip, int(udp_port))
 
+        # Learn/refresh gossiped peers (second-hand knowledge). New
+        # nodes are registered; known ones get their liveness
+        # refreshed because a peer we trust recently heard from them.
+        for entry in message.get("peers") or []:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+                continue
+
+            gossip_id, gossip_ip, gossip_port = entry
+
+            if (
+                not isinstance(gossip_id, str)
+                or not gossip_id
+                or gossip_id.startswith("peer-")
+                or gossip_id == self.node_id
+                or not isinstance(gossip_port, int)
+                or not (0 < gossip_port < 65536)
+            ):
+                continue
+
+            is_new = self.registry.get(gossip_id) is None
+
+            self.register_peer(gossip_id, str(gossip_ip), gossip_port)
+
+            if is_new:
+                logger.info(
+                    "[DISCOVERY] learned %s at %s:%d via %s gossip",
+                    gossip_id,
+                    gossip_ip,
+                    gossip_port,
+                    node_id,
+                )
+
     def register_peer(self, node_id: str, ip: str, udp_port: int) -> None:
         """
         Register or refresh a peer in the shared registry/topology.
@@ -326,6 +378,24 @@ class DiscoveryService:
             )
 
         self.peers[node_id] = (ip, udp_port)
+
+        # Reconcile provisional static-peer entries: once a real
+        # identity is learned for the same ip:port, drop the
+        # provisional "peer-ip:port" placeholder everywhere.
+        provisional_id = f"peer-{ip}:{udp_port}"
+
+        if provisional_id != node_id:
+            provisional = self.registry.get(provisional_id)
+
+            if provisional is not None:
+                self.registry.remove(provisional_id)
+                self.topology.disconnect(self.node_id, provisional_id)
+                self.topology.remove_node(provisional_id)
+                self.peers.pop(provisional_id, None)
+
+                for other_id in list(self.peers):
+                    if other_id not in (node_id, provisional_id):
+                        self.topology.disconnect(provisional_id, other_id)
 
         # Mesh edge maintenance.
         self.topology.add_node(node_id)
