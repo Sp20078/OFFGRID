@@ -19,14 +19,14 @@ class DeliveryManager:
         destination: str,
         payload: str,
         ttl: int = 8,
-        sequence: int = 0
+        sequence: int = 0,
     ) -> Message:
         message = Message.create(
             source=source,
             destination=destination,
             payload=payload,
             ttl=ttl,
-            sequence=sequence
+            sequence=sequence,
         )
 
         self.store.add(message)
@@ -52,7 +52,7 @@ class DeliveryManager:
             self.store.mark_expired(message.message_id)
             self.queue.remove(
                 message.message_id,
-                message.destination
+                message.destination,
             )
             return False
 
@@ -60,13 +60,25 @@ class DeliveryManager:
             self.queue.store(message)
             return False
 
-        route = self.router.find_route(message.destination)
+        # Person 1's Router uses source + destination.
+        route = self.router.find_route(
+            message.source,
+            message.destination,
+        )
 
         if not route:
             self.queue.store(message)
             return False
 
-        success = self.router.send(message, route)
+        # The actual network transport will eventually live
+        # behind the router/network layer.
+        send_method = getattr(self.router, "send", None)
+
+        if send_method is None:
+            self.queue.store(message)
+            return False
+
+        success = send_method(message, route)
 
         if success:
             self.store.mark_forwarded(message.message_id)
@@ -88,7 +100,7 @@ class DeliveryManager:
 
         self.queue.remove(
             message.message_id,
-            message.destination
+            message.destination,
         )
 
         self.retry_counts.pop(message_id, None)
@@ -102,7 +114,7 @@ class DeliveryManager:
             self.store.mark_expired(message_id)
             self.queue.remove(
                 message_id,
-                message.destination
+                message.destination,
             )
             return False
 
@@ -125,7 +137,7 @@ class DeliveryManager:
                 self.store.mark_expired(message.message_id)
                 self.queue.remove(
                     message.message_id,
-                    message.destination
+                    message.destination,
                 )
                 continue
 
@@ -136,7 +148,7 @@ class DeliveryManager:
 
                 self.queue.remove(
                     message.message_id,
-                    message.destination
+                    message.destination,
                 )
 
         return delivered
@@ -154,7 +166,7 @@ class DeliveryManager:
 
             self.queue.remove(
                 message.message_id,
-                message.destination
+                message.destination,
             )
 
             return False
