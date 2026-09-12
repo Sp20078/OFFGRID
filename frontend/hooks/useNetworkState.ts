@@ -1,294 +1,552 @@
 'use client';
 
-import { useState, useCallback, useRef, useEffect } from 'react';
-import { MeshNode, MeshLink, NetworkLog, NetworkMetrics, TransferState } from '@/types/network';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
-const INITIAL_NODES: MeshNode[] = [
-  { id: 'NODE_A', label: 'Node A (Origin)', status: 'ONLINE', ip: '10.0.0.1', latencyMs: 12, storedPacketsCount: 0, x: 14, y: 50, neighbors: ['Node B'], lastSeenMs: 1 },
-  { id: 'NODE_B', label: 'Node B (Relay 1)', status: 'ONLINE', ip: '10.0.0.2', latencyMs: 18, storedPacketsCount: 0, x: 32, y: 25, neighbors: ['Node A', 'Node C', 'Node D'], lastSeenMs: 2 },
-  { id: 'NODE_C', label: 'Node C (Relay 2)', status: 'ONLINE', ip: '10.0.0.3', latencyMs: 22, storedPacketsCount: 0, x: 50, y: 25, neighbors: ['Node B', 'Node D'], lastSeenMs: 2 },
-  { id: 'NODE_D', label: 'Node D (Relay 3)', status: 'ONLINE', ip: '10.0.0.4', latencyMs: 15, storedPacketsCount: 0, x: 68, y: 65, neighbors: ['Node B', 'Node C', 'Node E'], lastSeenMs: 3 },
-  { id: 'NODE_E', label: 'Node E (Target)', status: 'ONLINE', ip: '10.0.0.5', latencyMs: 25, storedPacketsCount: 0, x: 86, y: 50, neighbors: ['Node D'], lastSeenMs: 2 },
-];
+import {
+  getEvents,
+  getMetrics,
+  getNodes,
+  getRoute,
+  getTopology,
+  getWebSocketUrl,
+  killNode as apiKillNode,
+  resetNetwork as apiResetNetwork,
+  restoreNode as apiRestoreNode,
+  sendMessage,
+  toggleInternet as apiToggleInternet,
+} from '@/lib/api';
 
-const INITIAL_LINKS: MeshLink[] = [
-  { source: 'NODE_A', target: 'NODE_B', active: true, quality: 98 },
-  { source: 'NODE_B', target: 'NODE_C', active: true, quality: 95 },
-  { source: 'NODE_C', target: 'NODE_D', active: true, quality: 91 },
-  { source: 'NODE_D', target: 'NODE_E', active: true, quality: 99 },
-  { source: 'NODE_B', target: 'NODE_D', active: false, quality: 78 },
-];
+import {
+  MeshLink,
+  MeshNode,
+  NetworkLog,
+  NetworkMetrics,
+  TransferState,
+} from '@/types/network';
 
-const formatTimestamp = (date: Date = new Date()) => {
-  const pad = (n: number) => n.toString().padStart(2, '0');
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+type NetworkSnapshot = {
+  nodes: MeshNode[];
+  links: MeshLink[];
+  activeRoute?: string[];
+  metrics: NetworkMetrics;
+  logs: NetworkLog[];
+  internetOnline: boolean;
 };
 
-const INITIAL_LOGS: NetworkLog[] = [
-  { id: '1', timestamp: '12:00:00', level: 'INFO', message: 'OFFGRID Core initializing P2P discovery...' },
-  { id: '2', timestamp: '12:00:01', level: 'SUCCESS', message: 'Optimal path resolved: A → B → C → D → E' }
-];
+type TopologyResponse = {
+  nodes: MeshNode[];
+  links: MeshLink[];
+  activeRoute?: string[];
+};
+
+type RouteResponse = {
+  route?: string[];
+};
+
+const DEFAULT_SELECTED_NODE = 'NODE_C';
+
+const EMPTY_METRICS: NetworkMetrics = {
+  totalNodes: 0,
+  activeNodes: 0,
+  activeLinksCount: 0,
+  activePathHops: [],
+  internetAvailable: false,
+  storeAndForwardQueueSize: 0,
+  avgMeshLatencyMs: 0,
+};
+
+const EMPTY_TRANSFER_STATE: TransferState = {
+  isTransferring: false,
+  transferType: null,
+  transferProgress: 100,
+  messageQueue: 0,
+};
 
 export function useNetworkState() {
-  const [nodes, setNodes] = useState<MeshNode[]>(INITIAL_NODES);
-  const [links, setLinks] = useState<MeshLink[]>(INITIAL_LINKS);
-  const [activeRoute, setActiveRoute] = useState<string[]>(['NODE_A', 'NODE_B', 'NODE_C', 'NODE_D', 'NODE_E']);
-  const [selectedNodeId, setSelectedNodeId] = useState<string>('NODE_C');
-  const [internetOnline, setInternetOnline] = useState<boolean>(false); // Starts OFF as per wireframe: Internet: OFF (Amber)
-  const [logs, setLogs] = useState<NetworkLog[]>(INITIAL_LOGS);
-  const [transferState, setTransferState] = useState<TransferState>({
-    isTransferring: false,
-    transferType: null,
-    transferProgress: 100,
-    messageQueue: 0
-  });
+  const [nodes, setNodes] = useState<MeshNode[]>([]);
+  const [links, setLinks] = useState<MeshLink[]>([]);
+  const [activeRoute, setActiveRoute] = useState<string[]>([]);
+  const [selectedNodeId, setSelectedNodeId] = useState(
+    DEFAULT_SELECTED_NODE,
+  );
+  const [internetOnline, setInternetOnline] = useState(false);
+  const [logs, setLogs] = useState<NetworkLog[]>([]);
+  const [metrics, setMetrics] =
+    useState<NetworkMetrics>(EMPTY_METRICS);
 
-  const transferIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [transferState, setTransferState] =
+    useState<TransferState>(EMPTY_TRANSFER_STATE);
+
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const websocketRef = useRef<WebSocket | null>(null);
+
+  const applySnapshot = useCallback(
+    (snapshot: NetworkSnapshot) => {
+      const safeNodes = snapshot.nodes ?? [];
+      const safeLinks = snapshot.links ?? [];
+
+      const route =
+        snapshot.activeRoute ??
+        snapshot.metrics?.activePathHops ??
+        [];
+
+      const safeMetrics: NetworkMetrics =
+        snapshot.metrics ?? {
+          ...EMPTY_METRICS,
+          totalNodes: safeNodes.length,
+          activeNodes: safeNodes.filter(
+            (node) => node.status !== 'OFFLINE',
+          ).length,
+          activeLinksCount: safeLinks.filter(
+            (link) => link.active,
+          ).length,
+          activePathHops: route,
+          internetAvailable:
+            snapshot.internetOnline ?? false,
+        };
+
+      setNodes(safeNodes);
+      setLinks(safeLinks);
+      setActiveRoute(route);
+      setMetrics({
+        ...safeMetrics,
+        activePathHops: route,
+      });
+      setLogs(snapshot.logs ?? []);
+      setInternetOnline(snapshot.internetOnline ?? false);
+
+      setSelectedNodeId((current) => {
+        if (
+          current &&
+          safeNodes.some((node) => node.id === current)
+        ) {
+          return current;
+        }
+
+        return safeNodes[0]?.id ?? DEFAULT_SELECTED_NODE;
+      });
+    },
+    [],
+  );
+
+  const refreshNetwork = useCallback(async () => {
+    try {
+      setError(null);
+
+      const [
+        nodesResponse,
+        topologyResponse,
+        metricsResponse,
+        eventsResponse,
+        routeResponse,
+      ] = await Promise.all([
+        getNodes(),
+        getTopology() as Promise<TopologyResponse>,
+        getMetrics() as Promise<NetworkMetrics>,
+        getEvents() as Promise<NetworkLog[]>,
+        getRoute('NODE_E') as Promise<RouteResponse>,
+      ]);
+
+      const route =
+        routeResponse?.route ??
+        topologyResponse?.activeRoute ??
+        metricsResponse?.activePathHops ??
+        [];
+
+      applySnapshot({
+        nodes: nodesResponse ?? [],
+        links: topologyResponse?.links ?? [],
+        activeRoute: route,
+        metrics: {
+          ...EMPTY_METRICS,
+          ...(metricsResponse ?? {}),
+          activePathHops: route,
+        },
+        logs: eventsResponse ?? [],
+        internetOnline:
+          metricsResponse?.internetAvailable ?? false,
+      });
+    } catch (err) {
+      console.error(
+        'Failed to refresh OFFGRID state:',
+        err,
+      );
+
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Failed to connect to OFFGRID backend',
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, [applySnapshot]);
 
   useEffect(() => {
-    return () => {
-      if (transferIntervalRef.current) clearInterval(transferIntervalRef.current);
-    };
-  }, []);
+    void refreshNetwork();
+  }, [refreshNetwork]);
 
-  const addLog = useCallback((message: string, level: NetworkLog['level'], nodeId?: string) => {
-    const newLog: NetworkLog = {
-      id: Math.random().toString(),
-      timestamp: formatTimestamp(),
-      level,
-      message,
-      nodeId
-    };
-    setLogs(prev => [newLog, ...prev.slice(0, 49)]);
-  }, []);
+  useEffect(() => {
+    let socket: WebSocket | null = null;
 
-  const toggleInternet = useCallback(() => {
-    setInternetOnline(prev => {
-      const nextState = !prev;
-      addLog(
-        nextState ? 'WAN Gateway online. Synchronizing cloud metrics.' : 'WAN Connection severed. Switching to OFFGRID P2P fallback.',
-        nextState ? 'SUCCESS' : 'WARN'
-      );
-      return nextState;
-    });
-  }, [addLog]);
+    try {
+      socket = new WebSocket(getWebSocketUrl());
+      websocketRef.current = socket;
 
-  const killNode = useCallback((nodeId: 'NODE_C' | 'NODE_E') => {
-    setNodes(prev => {
-      const targetNode = prev.find(n => n.id === nodeId);
-      if (targetNode?.status === 'OFFLINE') return prev;
+      socket.onopen = () => {
+        console.log('OFFGRID WebSocket connected');
+      };
 
-      addLog(`${targetNode?.label || nodeId} offline. Connection lost.`, 'ERROR', nodeId);
+      socket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
 
-      if (nodeId === 'NODE_C') {
-        setTimeout(() => {
-          setLinks(currLinks => currLinks.map(link => {
-            if (link.source === 'NODE_B' && link.target === 'NODE_C') return { ...link, active: false };
-            if (link.source === 'NODE_C' && link.target === 'NODE_D') return { ...link, active: false };
-            if (link.source === 'NODE_B' && link.target === 'NODE_D') return { ...link, active: true };
-            return link;
-          }));
-
-          setNodes(latestNodes => {
-            const isEOffline = latestNodes.find(n => n.id === 'NODE_E')?.status === 'OFFLINE';
-            const newRoute = isEOffline 
-              ? ['NODE_A', 'NODE_B', 'NODE_D'] 
-              : ['NODE_A', 'NODE_B', 'NODE_D', 'NODE_E'];
-            setActiveRoute(newRoute);
-            addLog(`Route recalculated: ${newRoute.map(id => id.replace('NODE_', '')).join(' → ')}`, 'WARN');
-            return latestNodes;
-          });
-        }, 300);
-      } else if (nodeId === 'NODE_E') {
-        setTimeout(() => {
-          setLinks(currLinks => currLinks.map(link => {
-            if (link.source === 'NODE_D' && link.target === 'NODE_E') return { ...link, active: false };
-            return link;
-          }));
-
-          setNodes(latestNodes => {
-            const isCOffline = latestNodes.find(n => n.id === 'NODE_C')?.status === 'OFFLINE';
-            const newRoute = isCOffline 
-              ? ['NODE_A', 'NODE_B', 'NODE_D'] 
-              : ['NODE_A', 'NODE_B', 'NODE_C', 'NODE_D'];
-            setActiveRoute(newRoute);
-            addLog(`Target Node E unreachable. Route truncated at Node D. Store-and-Forward queue active.`, 'WARN');
-            return latestNodes;
-          });
-        }, 300);
-      }
-
-      return prev.map(node => 
-        node.id === nodeId ? { ...node, status: 'OFFLINE', latencyMs: 0 } : node
-      );
-    });
-  }, [addLog]);
-
-  const restoreNode = useCallback((nodeId: 'NODE_C' | 'NODE_E') => {
-    setNodes(prev => {
-      const targetNode = prev.find(n => n.id === nodeId);
-      if (targetNode?.status === 'ONLINE') return prev;
-
-      addLog(`${targetNode?.label || nodeId} restored. Re-establishing link heartbeats...`, 'SUCCESS', nodeId);
-
-      if (nodeId === 'NODE_C') {
-        setLinks(currLinks => currLinks.map(link => {
-          if (link.source === 'NODE_B' && link.target === 'NODE_C') return { ...link, active: true };
-          if (link.source === 'NODE_C' && link.target === 'NODE_D') return { ...link, active: true };
-          if (link.source === 'NODE_B' && link.target === 'NODE_D') return { ...link, active: false };
-          return link;
-        }));
-
-        setNodes(latestNodes => {
-          const isEOffline = latestNodes.find(n => n.id === 'NODE_E')?.status === 'OFFLINE';
-          const newRoute = isEOffline 
-            ? ['NODE_A', 'NODE_B', 'NODE_C', 'NODE_D'] 
-            : ['NODE_A', 'NODE_B', 'NODE_C', 'NODE_D', 'NODE_E'];
-          setActiveRoute(newRoute);
-          addLog(`Route restored to optimal path: ${newRoute.map(id => id.replace('NODE_', '')).join(' → ')}`, 'SUCCESS');
-          return latestNodes;
-        });
-      } else if (nodeId === 'NODE_E') {
-        setLinks(currLinks => currLinks.map(link => {
-          if (link.source === 'NODE_D' && link.target === 'NODE_E') return { ...link, active: true };
-          return link;
-        }));
-
-        setNodes(latestNodes => {
-          const isCOffline = latestNodes.find(n => n.id === 'NODE_C')?.status === 'OFFLINE';
-          const newRoute = isCOffline 
-            ? ['NODE_A', 'NODE_B', 'NODE_D', 'NODE_E'] 
-            : ['NODE_A', 'NODE_B', 'NODE_C', 'NODE_D', 'NODE_E'];
-          setActiveRoute(newRoute);
-
-          // Flush stored packets if Node D had buffered anything
-          const nodeD = latestNodes.find(n => n.id === 'NODE_D');
-          if (nodeD && nodeD.storedPacketsCount > 0) {
-            addLog(`Flushing ${nodeD.storedPacketsCount} stored packet(s) from Node D buffer to Node E.`, 'SUCCESS');
+          if (
+            message?.type === 'NETWORK_STATE' &&
+            message?.data
+          ) {
+            applySnapshot(message.data);
           }
-          addLog(`Route extended to Target Node E: ${newRoute.map(id => id.replace('NODE_', '')).join(' → ')}`, 'SUCCESS');
+        } catch (err) {
+          console.error(
+            'Invalid OFFGRID WebSocket message:',
+            err,
+          );
+        }
+      };
 
-          return latestNodes.map(n => n.id === 'NODE_D' ? { ...n, storedPacketsCount: 0 } : n);
-        });
-      }
+      socket.onerror = (event) => {
+        console.warn(
+          'OFFGRID WebSocket error:',
+          event,
+        );
+      };
 
-      const defaultLatency = nodeId === 'NODE_C' ? 22 : 25;
-      return prev.map(node => 
-        node.id === nodeId ? { ...node, status: 'ONLINE', latencyMs: defaultLatency } : node
+      socket.onclose = () => {
+        websocketRef.current = null;
+      };
+    } catch (err) {
+      console.error(
+        'Unable to open OFFGRID WebSocket:',
+        err,
       );
-    });
-  }, [addLog]);
-
-  const sendTransfer = useCallback((type: 'MESSAGE' | 'FILE') => {
-    if (transferState.isTransferring) {
-      setTransferState(prev => ({ ...prev, messageQueue: prev.messageQueue + 1 }));
-      addLog(`Transfer in flight. Queued additional ${type.toLowerCase()} for relay.`, 'INFO');
-      return;
     }
 
-    addLog(`Initiating P2P ${type === 'FILE' ? 'chunked binary transfer' : 'telemetry payload'} from Node A...`, 'INFO');
-    setTransferState(prev => ({
-      ...prev,
-      isTransferring: true,
-      transferType: type,
-      transferProgress: 0
-    }));
+    return () => {
+      socket?.close();
+      websocketRef.current = null;
+    };
+  }, [applySnapshot]);
 
-    if (transferIntervalRef.current) clearInterval(transferIntervalRef.current);
+  const toggleInternet = useCallback(async () => {
+    try {
+      setError(null);
 
-    let progress = 0;
-    transferIntervalRef.current = setInterval(() => {
-      progress += 20;
-      if (progress === 40) {
-        setNodes(currNodes => {
-          const isCOffline = currNodes.find(n => n.id === 'NODE_C')?.status === 'OFFLINE';
-          if (isCOffline) {
-            addLog('Message forwarded via fallback hop: Node B → Node D', 'INFO');
-          } else {
-            addLog('Packet relayed through Node B → Node C', 'INFO');
-          }
-          return currNodes;
+      const nextState = !internetOnline;
+
+      const snapshot = await apiToggleInternet(
+        nextState,
+      );
+
+      applySnapshot({
+        nodes: snapshot?.nodes ?? nodes,
+        links: snapshot?.links ?? links,
+        activeRoute: snapshot?.activeRoute ?? activeRoute,
+        metrics:
+          snapshot?.metrics ?? {
+            ...metrics,
+            internetAvailable: nextState,
+          },
+        logs: snapshot?.logs ?? logs,
+        internetOnline:
+          snapshot?.internetOnline ?? nextState,
+      });
+    } catch (err) {
+      console.error(err);
+
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Failed to change internet state',
+      );
+
+      await refreshNetwork();
+    }
+  }, [
+    activeRoute,
+    applySnapshot,
+    internetOnline,
+    links,
+    logs,
+    metrics,
+    nodes,
+    refreshNetwork,
+  ]);
+
+  const killNode = useCallback(
+    async (nodeId: 'NODE_C' | 'NODE_E') => {
+      try {
+        setError(null);
+
+        const snapshot = await apiKillNode(nodeId);
+
+        applySnapshot({
+          nodes: snapshot?.nodes ?? nodes,
+          links: snapshot?.links ?? links,
+          activeRoute:
+            snapshot?.activeRoute ??
+            snapshot?.metrics?.activePathHops ??
+            [],
+          metrics: snapshot?.metrics ?? metrics,
+          logs: snapshot?.logs ?? logs,
+          internetOnline:
+            snapshot?.internetOnline ?? internetOnline,
         });
+      } catch (err) {
+        console.error(err);
+
+        setError(
+          err instanceof Error
+            ? err.message
+            : 'Failed to kill node',
+        );
+
+        await refreshNetwork();
+      }
+    },
+    [
+      applySnapshot,
+      internetOnline,
+      links,
+      logs,
+      metrics,
+      nodes,
+      refreshNetwork,
+    ],
+  );
+
+  const restoreNode = useCallback(
+    async (nodeId: 'NODE_C' | 'NODE_E') => {
+      try {
+        setError(null);
+
+        const snapshot =
+          await apiRestoreNode(nodeId);
+
+        applySnapshot({
+          nodes: snapshot?.nodes ?? nodes,
+          links: snapshot?.links ?? links,
+          activeRoute:
+            snapshot?.activeRoute ??
+            snapshot?.metrics?.activePathHops ??
+            [],
+          metrics: snapshot?.metrics ?? metrics,
+          logs: snapshot?.logs ?? logs,
+          internetOnline:
+            snapshot?.internetOnline ?? internetOnline,
+        });
+      } catch (err) {
+        console.error(err);
+
+        setError(
+          err instanceof Error
+            ? err.message
+            : 'Failed to restore node',
+        );
+
+        await refreshNetwork();
+      }
+    },
+    [
+      applySnapshot,
+      internetOnline,
+      links,
+      logs,
+      metrics,
+      nodes,
+      refreshNetwork,
+    ],
+  );
+
+  const sendTransfer = useCallback(
+    async (type: 'MESSAGE' | 'FILE') => {
+      if (transferState.isTransferring) {
+        setTransferState((previous) => ({
+          ...previous,
+          messageQueue:
+            previous.messageQueue + 1,
+        }));
+
+        return;
       }
 
-      if (progress >= 100) {
-        if (transferIntervalRef.current) clearInterval(transferIntervalRef.current);
-        setTransferState(prev => ({
+      if (type === 'FILE') {
+        setError(
+          'File transfer backend integration is not connected yet.',
+        );
+        return;
+      }
+
+      try {
+        setError(null);
+
+        setTransferState({
+          isTransferring: true,
+          transferType: 'MESSAGE',
+          transferProgress: 10,
+          messageQueue: 0,
+        });
+
+        const result = await sendMessage(
+          'NODE_A',
+          'NODE_E',
+          'Emergency evacuation at Block B.',
+        );
+
+        const returnedRoute =
+          result?.route ?? [];
+
+        setActiveRoute(returnedRoute);
+
+        await refreshNetwork();
+
+        if (result?.status === 'PENDING') {
+          setTransferState({
+            isTransferring: false,
+            transferType: null,
+            transferProgress: 0,
+            messageQueue: 1,
+          });
+
+          setError(
+            'Node E is offline. Message stored locally and waiting for destination.',
+          );
+
+          return;
+        }
+
+        if (result?.status !== 'DELIVERED') {
+          setTransferState({
+            isTransferring: false,
+            transferType: null,
+            transferProgress: 0,
+            messageQueue: 0,
+          });
+
+          setError(
+            'Message was not delivered.',
+          );
+
+          return;
+        }
+
+        setTransferState({
           isTransferring: false,
           transferType: null,
           transferProgress: 100,
-          messageQueue: Math.max(0, prev.messageQueue - 1)
-        }));
-
-        setNodes(currNodes => {
-          const isEOffline = currNodes.find(n => n.id === 'NODE_E')?.status === 'OFFLINE';
-          if (isEOffline) {
-            addLog(`Target Node E offline. Payload saved to Node D Store-and-Forward queue.`, 'WARN');
-            return currNodes.map(n => n.id === 'NODE_D' ? { ...n, storedPacketsCount: n.storedPacketsCount + 1 } : n);
-          } else {
-            addLog(`Payload delivered successfully to Node E (Target). Transfer verified.`, 'SUCCESS');
-            return currNodes;
-          }
+          messageQueue: 0,
         });
-      } else {
-        setTransferState(prev => ({ ...prev, transferProgress: progress }));
+      } catch (err) {
+        console.error(err);
+
+        setTransferState({
+          isTransferring: false,
+          transferType: null,
+          transferProgress: 0,
+          messageQueue: 0,
+        });
+
+        setError(
+          err instanceof Error
+            ? err.message
+            : 'Failed to send message',
+        );
       }
-    }, 200);
-  }, [addLog, transferState.isTransferring]);
+    },
+    [
+      refreshNetwork,
+      transferState.isTransferring,
+    ],
+  );
 
-  const resetNetwork = useCallback(() => {
-    if (transferIntervalRef.current) {
-      clearInterval(transferIntervalRef.current);
-      transferIntervalRef.current = null;
+  const resetNetwork = useCallback(async () => {
+    try {
+      setError(null);
+
+      const snapshot =
+        await apiResetNetwork();
+
+      setTransferState(
+        EMPTY_TRANSFER_STATE,
+      );
+
+      applySnapshot({
+        nodes: snapshot?.nodes ?? [],
+        links: snapshot?.links ?? [],
+        activeRoute:
+          snapshot?.activeRoute ??
+          snapshot?.metrics?.activePathHops ??
+          [],
+        metrics:
+          snapshot?.metrics ?? EMPTY_METRICS,
+        logs: snapshot?.logs ?? [],
+        internetOnline:
+          snapshot?.internetOnline ?? false,
+      });
+    } catch (err) {
+      console.error(err);
+
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Failed to reset network',
+      );
+
+      await refreshNetwork();
     }
-    setNodes(INITIAL_NODES);
-    setLinks(INITIAL_LINKS);
-    setActiveRoute(['NODE_A', 'NODE_B', 'NODE_C', 'NODE_D', 'NODE_E']);
-    setInternetOnline(false);
-    setSelectedNodeId('NODE_C');
-    setTransferState({
-      isTransferring: false,
-      transferType: null,
-      transferProgress: 100,
-      messageQueue: 0
-    });
-    addLog('Network topology reset to initial state.', 'INFO');
-  }, [addLog]);
+  }, [applySnapshot, refreshNetwork]);
 
-  const activeNodesList = nodes.filter(n => n.status !== 'OFFLINE');
-  const activeLinksCount = links.filter(l => l.active).length;
-  const avgMeshLatencyMs = activeNodesList.length > 0
-    ? Math.round(activeNodesList.reduce((acc, n) => acc + n.latencyMs, 0) / activeNodesList.length)
-    : 0;
-
-  const metrics: NetworkMetrics = {
-    totalNodes: nodes.length,
-    activeNodes: activeNodesList.length,
-    activeLinksCount,
-    activePathHops: activeRoute,
-    internetAvailable: internetOnline,
-    storeAndForwardQueueSize: nodes.reduce((acc, n) => acc + n.storedPacketsCount, 0),
-    avgMeshLatencyMs
-  };
-
-  const selectedNode = nodes.find(n => n.id === selectedNodeId) || nodes[0];
+  const selectedNode =
+    nodes.find(
+      (node) => node.id === selectedNodeId,
+    ) ??
+    nodes[0] ??
+    ({
+      id: DEFAULT_SELECTED_NODE,
+      label: 'Loading...',
+      status: 'OFFLINE',
+      ip: '',
+      latencyMs: 0,
+      storedPacketsCount: 0,
+      x: 50,
+      y: 50,
+      neighbors: [],
+      lastSeenMs: 0,
+    } satisfies MeshNode);
 
   return {
     nodes,
     links,
     activeRoute,
     selectedNode,
+    selectedNodeId,
     setSelectedNodeId,
     internetOnline,
     logs,
     metrics,
     transferState,
+    loading,
+    error,
+
     actions: {
       toggleInternet,
       killNode,
       restoreNode,
       sendTransfer,
-      resetNetwork
-    }
+      resetNetwork,
+      refreshNetwork,
+    },
   };
 }
