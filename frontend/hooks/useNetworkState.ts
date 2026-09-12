@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { MeshNode, MeshLink, NetworkLog, NetworkMetrics, TransferState } from '@/types/network';
+import { RealNodeSnapshot, RealNodeSnapshotLog, fetchSnapshot, sendRealMessage } from '@/lib/realNodeApi';
 
 const INITIAL_NODES: MeshNode[] = [
   { id: 'NODE_A', label: 'Node A (Origin)', status: 'ONLINE', ip: '10.0.0.1', latencyMs: 12, storedPacketsCount: 0, x: 14, y: 50, neighbors: ['Node B'], lastSeenMs: 1 },
@@ -29,13 +30,27 @@ const INITIAL_LOGS: NetworkLog[] = [
   { id: '2', timestamp: '12:00:01', level: 'SUCCESS', message: 'Optimal path resolved: A → B → C → D → E' }
 ];
 
+/** API base of the real node this dashboard should mirror, if any. */
+function resolveRealNodeUrl(): string | null {
+  if (typeof window === 'undefined') return null;
+  const url = process.env.NEXT_PUBLIC_OFFGRID_API?.trim();
+  return url ? url.replace(/\/$/, '') : null;
+}
+
 export function useNetworkState() {
+  const realNodeUrlRef = useRef<string | null>(null);
+  if (realNodeUrlRef.current === null) {
+    realNodeUrlRef.current = resolveRealNodeUrl();
+  }
+
   const [nodes, setNodes] = useState<MeshNode[]>(INITIAL_NODES);
   const [links, setLinks] = useState<MeshLink[]>(INITIAL_LINKS);
   const [activeRoute, setActiveRoute] = useState<string[]>(['NODE_A', 'NODE_B', 'NODE_C', 'NODE_D', 'NODE_E']);
   const [selectedNodeId, setSelectedNodeId] = useState<string>('NODE_C');
   const [internetOnline, setInternetOnline] = useState<boolean>(false); // Starts OFF as per wireframe: Internet: OFF (Amber)
   const [logs, setLogs] = useState<NetworkLog[]>(INITIAL_LOGS);
+  const [liveMode, setLiveMode] = useState<boolean>(false);
+  const [sendingMessage, setSendingMessage] = useState<boolean>(false);
   const [transferState, setTransferState] = useState<TransferState>({
     isTransferring: false,
     transferType: null,
@@ -61,6 +76,88 @@ export function useNetworkState() {
     };
     setLogs(prev => [newLog, ...prev.slice(0, 49)]);
   }, []);
+
+  // ------------------------------------------------------------------
+  // REAL LAN MODE: poll the local node's FastAPI and mirror its state.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const baseUrl = realNodeUrlRef.current;
+    if (!baseUrl) return;
+
+    let cancelled = false;
+
+    const poll = async () => {
+      try {
+        const snap: RealNodeSnapshot = await fetchSnapshot(baseUrl);
+        if (cancelled) return;
+
+        setNodes(
+          snap.nodes.map(n => ({
+            ...n,
+            label: n.label || n.id,
+            latencyMs: n.status === 'ONLINE' ? n.latencyMs || 15 : 0,
+          }))
+        );
+        setLinks(
+          snap.links.map(l => ({
+            source: l.source,
+            target: l.target,
+            active: l.active,
+            quality: Math.round((l.quality ?? 0) * 100),
+          }))
+        );
+        setActiveRoute(snap.activeRoute || []);
+        setInternetOnline(false);
+        setLiveMode(true);
+
+        if (snap.logs?.length) {
+          const mapped: NetworkLog[] = snap.logs.map((log: RealNodeSnapshotLog) => ({
+            id: log.id,
+            timestamp: formatTimestamp(new Date(log.timestamp)),
+            level: (['INFO', 'WARN', 'ERROR', 'SUCCESS'].includes(log.level) ? log.level : 'INFO') as NetworkLog['level'],
+            message: log.message,
+            nodeId: log.nodeId ?? undefined,
+          }));
+          setLogs(mapped.reverse());
+        }
+      } catch {
+        if (!cancelled) setLiveMode(false);
+      }
+    };
+
+    poll();
+    const interval = setInterval(poll, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  const sendMessageToNode = useCallback(
+    async (destination: string, payload: string): Promise<boolean> => {
+      const baseUrl = realNodeUrlRef.current;
+      if (!baseUrl) {
+        addLog('Live node API not configured (NEXT_PUBLIC_OFFGRID_API).', 'ERROR');
+        return false;
+      }
+
+      setSendingMessage(true);
+      try {
+        const result = await sendRealMessage(baseUrl, destination, payload);
+        addLog(
+          `Message to ${destination}: ${result.status} (route: ${result.route?.join(' → ') || 'flooding'})`,
+          result.status === 'FORWARDED' ? 'SUCCESS' : 'WARN'
+        );
+        return result.status === 'FORWARDED';
+      } catch (error) {
+        addLog(`Send failed: ${error instanceof Error ? error.message : 'unknown error'}`, 'ERROR');
+        return false;
+      } finally {
+        setSendingMessage(false);
+      }
+    },
+    [addLog]
+  );
 
   const toggleInternet = useCallback(() => {
     setInternetOnline(prev => {
@@ -283,6 +380,9 @@ export function useNetworkState() {
     logs,
     metrics,
     transferState,
+    liveMode,
+    sendingMessage,
+    sendMessageToNode,
     actions: {
       toggleInternet,
       killNode,

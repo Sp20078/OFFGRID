@@ -21,6 +21,9 @@ export default function Home() {
     logs,
     metrics,
     transferState,
+    liveMode,
+    sendingMessage,
+    sendMessageToNode,
     actions
   } = useNetworkState();
 
@@ -77,6 +80,9 @@ export default function Home() {
             onSendFile={() => actions.sendTransfer('FILE')}
             transferState={transferState}
             nodes={nodes}
+            liveMode={liveMode}
+            sendingMessage={sendingMessage}
+            onSendCustomMessage={sendMessageToNode}
           />
         )}
 

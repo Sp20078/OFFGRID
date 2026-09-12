@@ -62,6 +62,7 @@ class DiscoveryService:
         discovery_port: int = 9999,
         announce_interval: float = 2.0,
         heartbeat_timeout: float = 6.0,
+        allowed_links: Optional[set] = None,
     ):
         self.transport = transport
         self.node_id = node_id
@@ -72,6 +73,9 @@ class DiscoveryService:
         self.discovery_port = discovery_port
         self.announce_interval = announce_interval
         self.heartbeat_timeout = heartbeat_timeout
+        # When set (from --links), only these node-id pairs are
+        # topology neighbors; otherwise discovery forms a full mesh.
+        self.allowed_links = allowed_links
 
         self._announce_task: Optional[asyncio.Task] = None
         self._expiry_task: Optional[asyncio.Task] = None
@@ -168,16 +172,76 @@ class DiscoveryService:
         }
 
     async def _announce_loop(self) -> None:
+        """
+        Announce to every plausible discovery target.
+
+        - 255.255.255.255          (global broadcast, works on most Wi-Fi LANs)
+        - <subnet>.255              (directed broadcast, e.g. 192.168.1.255;
+                                    often more reliable than the global one)
+        - 127.0.0.1                 (lets several demo nodes share one laptop)
+        """
+        payload = _dumps(self._announcement())
+
+        targets = {"255.255.255.255", "127.0.0.1"}
+
+        subnet_broadcast = self._subnet_broadcast()
+
+        if subnet_broadcast:
+            targets.add(subnet_broadcast)
+
         while self._running:
-            try:
-                self.transport.send_broadcast(
-                    _dumps(self._announcement()),
-                    self.discovery_port,
-                )
-            except Exception:
-                logger.exception("Failed to send discovery announcement")
+            for target in targets:
+                try:
+                    self._send_announcement(payload, target)
+                except Exception:
+                    logger.exception(
+                        "Failed to send discovery announcement to %s", target
+                    )
+
+            # Unicast to every known peer's transport port as well:
+            # that socket is exclusively bound, so delivery is
+            # guaranteed. This self-heals discovery when broadcast is
+            # flaky (shared-host REUSEPORT balancing) or blocked by
+            # the network entirely.
+            for peer_id, (peer_ip, peer_port) in list(self.peers.items()):
+                try:
+                    self.transport.send_to(payload, (peer_ip, peer_port))
+                except Exception:
+                    logger.debug("Unicast announcement to %s failed", peer_id)
 
             await asyncio.sleep(self.announce_interval)
+
+    def _send_announcement(self, payload: bytes, target: str) -> None:
+        """
+        Send one announcement datagram.
+
+        Uses a fresh ephemeral socket per announcement: with
+        SO_REUSEPORT the kernel hashes the 4-tuple to pick one
+        listener, and a fixed source port would always land on the
+        same process (sometimes our own). A fresh source port makes
+        same-machine multi-node demos reliable. On real laptops
+        (distinct IPs) any approach works.
+        """
+        import socket as _socket
+
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+
+        try:
+            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
+            sock.sendto(payload, (target, self.discovery_port))
+        finally:
+            sock.close()
+
+    def _subnet_broadcast(self) -> Optional[str]:
+        """Best-effort x.y.z.255 broadcast address for a /24-style LAN."""
+        ip = self.local_ip()
+
+        parts = ip.split(".")
+
+        if len(parts) != 4 or ip.startswith("127."):
+            return None
+
+        return f"{parts[0]}.{parts[1]}.{parts[2]}.255"
 
     # ------------------------------------------------------------------
     # Receiving
@@ -252,11 +316,24 @@ class DiscoveryService:
 
         # Mesh edge maintenance.
         self.topology.add_node(node_id)
-        self.topology.connect(self.node_id, node_id)
 
-        for other_id in self.peers:
-            if other_id != node_id:
-                self.topology.connect(node_id, other_id)
+        if self.allowed_links is None:
+            # Full mesh: every discovered peer is directly reachable.
+            self.topology.connect(self.node_id, node_id)
+
+            for other_id in self.peers:
+                if other_id != node_id:
+                    self.topology.connect(node_id, other_id)
+        else:
+            # Configured-links mode (--links): only the given pairs.
+            if frozenset((self.node_id, node_id)) in self.allowed_links:
+                self.topology.connect(self.node_id, node_id)
+
+            for other_id in self.peers:
+                if other_id != node_id and frozenset(
+                    (node_id, other_id)
+                ) in self.allowed_links:
+                    self.topology.connect(node_id, other_id)
 
         if is_new:
             logger.info(

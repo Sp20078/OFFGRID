@@ -96,6 +96,10 @@ class PacketRelay:
 
         return self.router.find_route(source, destination)
 
+    def reachable_neighbor_ids(self) -> List[str]:
+        """Node IDs of direct neighbors with a discovered address."""
+        return [neighbor_id for neighbor_id, _ in self._neighbor_addresses()]
+
     def next_hop_address(self, destination: str) -> Optional[RelayAddress]:
         """
         Resolve the real socket address of the next hop towards a

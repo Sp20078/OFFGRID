@@ -13,7 +13,8 @@
   <img src="https://img.shields.io/badge/Network-P2P%20Mesh-blue?style=for-the-badge">
   <img src="https://img.shields.io/badge/Communication-Offline-orange?style=for-the-badge">
   <img src="https://img.shields.io/badge/Files-Chunked%20Transfer-purple?style=for-the-badge">
-  <img src="https://img.shields.io/badge/Tests-25%20Passing-brightgreen?style=for-the-badge">
+  <img src="https://img.shields.io/badge/Tests-80%20Passing-brightgreen?style=for-the-badge">
+  <img src="https://img.shields.io/badge/Real%20LAN-UDP%20Multi--hop-teal?style=for-the-badge">
 </p>
 
 ---
@@ -384,13 +385,16 @@ Retry Mechanism               ✅
 TTL Expiration                ✅
 File Chunking                 ✅
 File Reassembly               ✅
-File Transfer Integration     ✅
-Current test status
-25 TESTS
+File Transfer Integration     ✅Current test status
+
+80 TESTS
    │
-   ├── 25 PASSED ✅
+   ├── 80 PASSED ✅
    │
    └── 0 FAILED
+
+   (34 real-LAN networking tests included: UDP transport, discovery,
+   multi-hop forwarding, ACK return path, store-and-forward, rerouting)
 🚨 Designed For
 
 OFFGRID is designed around situations where normal communication infrastructure becomes unreliable.
@@ -535,3 +539,105 @@ Built as a collaborative project with separate engineering modules.
     Research and presentation  │
 │                                           │
 └───────────────────────────────────────────┘
+---
+
+## 📡 REAL LAN MODE — 5-Laptop Offline Mesh
+
+REAL LAN MODE runs real UDP sockets on each laptop. The old in-memory
+demo (`backend/api/app.py` + dashboard simulation) is untouched and
+still works for presentations.
+
+### Quick start (any laptop)
+
+```bash
+pip install -r requirements.txt
+
+# Laptop 1
+python node.py --id NODE_A --port 9001 --api-port 8001
+
+# Laptop 2
+python node.py --id NODE_B --port 9002 --api-port 8002
+
+# Laptop 3
+python node.py --id NODE_C --port 9003 --api-port 8003
+
+# Laptop 4
+python node.py --id NODE_D --port 9004 --api-port 8004
+
+# Laptop 5
+python node.py --id NODE_E --port 9005 --api-port 8005
+```
+
+All laptops must be on the same Wi-Fi/LAN. No Internet needed —
+discovery uses UDP broadcast on port 9999 and peers find each other
+automatically.
+
+Useful flags:
+
+```
+--host 0.0.0.0            bind address (default 0.0.0.0)
+--peers 192.168.1.102:9002,192.168.1.103:9003
+                          static peers (fallback if broadcast is blocked)
+--links NODE_A:NODE_B,NODE_B:NODE_C
+                          shape the mesh (default: full mesh of discovered peers)
+--discovery 9999          discovery/broadcast port
+--no-api                  headless node (no dashboard API)
+--check-network           print LAN diagnostics and exit
+```
+
+### Send Laptop 1 -> Laptop 2 (first acceptance test)
+
+```bash
+curl -X POST http://127.0.0.1:8001/messages \
+  -H "Content-Type: application/json" \
+  -d '{"destination":"NODE_B","payload":"Hello from Laptop 1"}'
+```
+
+Laptop 2 logs `[DELIVERED] from NODE_A: Hello from Laptop 1` and an ACK
+travels back so Laptop 1 reports DELIVERED.
+
+### Multi-hop (A -> E) and rerouting
+
+With the `--links` flag forming a chain, packets physically hop
+A → B → C → D → E over UDP (BFS routing, mesh-flooding fallback).
+Kill NODE_C (`Ctrl+C`): heartbeats expire it after 6 s, topology drops
+it, and the route recalculates (e.g. A → B → D → E where links exist).
+Messages sent to an offline destination are stored (PENDING) and
+delivered automatically when it returns.
+
+### Verify
+
+```bash
+curl http://127.0.0.1:8001/health              # node status + LAN IP
+curl http://127.0.0.1:8001/peers               # discovered peers
+curl http://127.0.0.1:8001/network/topology    # dashboard snapshot
+curl http://127.0.0.1:8001/inbox               # messages received here
+curl http://127.0.0.1:8001/messages            # pending (store-and-forward)
+curl http://127.0.0.1:8001/routes/NODE_E       # BFS route to a destination
+```
+
+### Dashboard (real mode)
+
+Run one node with an API port (e.g. NODE_A on 8001), then point the
+Next.js dashboard at it:
+
+```bash
+cd frontend
+NEXT_PUBLIC_OFFGRID_API=http://127.0.0.1:8001 npm run dev
+```
+
+The dashboard mirrors the live node: real discovered peers, ONLINE /
+OFFLINE status, links, active route and log events. The Transfers tab
+gains a **Custom Message** composer that sends arbitrary text through
+the real network (`POST /messages`). Without `NEXT_PUBLIC_OFFGRID_API`
+the dashboard falls back to the built-in simulation.
+
+> CORS is pre-allowed for `localhost:3000/3001`. To reach the API from a
+> different machine's browser, add that origin in `backend/api/real_api.py`.
+
+### Tests
+
+```bash
+python -m pytest backend -q      # 80 tests
+```
+

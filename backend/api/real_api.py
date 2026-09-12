@@ -21,6 +21,16 @@ from pydantic import BaseModel, Field
 from backend.network.packet import Packet
 
 
+class MessageRequest(BaseModel):
+    """Body of POST /messages (module-level so FastAPI can resolve
+    its annotation under `from __future__ import annotations`)."""
+
+    destination: str = Field(..., min_length=1, max_length=64)
+    payload: str = Field(..., min_length=1, max_length=5000)
+    ttl: int = Field(default=10, ge=1, le=64)
+    source: Optional[str] = Field(default=None, max_length=64)
+
+
 def create_app(node) -> FastAPI:
     """
     Build the API app for the given RealNode instance.
@@ -45,12 +55,6 @@ def create_app(node) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    class MessageRequest(BaseModel):
-        destination: str = Field(..., min_length=1, max_length=64)
-        payload: str = Field(..., min_length=1, max_length=5000)
-        ttl: int = Field(default=10, ge=1, le=64)
-        source: Optional[str] = Field(default=None, max_length=64)
 
     # ------------------------------------------------------------------
     # Health / info

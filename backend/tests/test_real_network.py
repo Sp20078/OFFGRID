@@ -879,7 +879,8 @@ def test_realnode_end_to_end_multihop():
         await node_c.stop()
 
         assert node_c.relay.inbox[-1]["text"] == "hop hop"
-        assert node_b.relay.stats["forwarded_packets"] == 1
+        # B forwards the DATA packet AND the returning ACK.
+        assert node_b.relay.stats["forwarded_packets"] == 2
 
     asyncio.run(scenario())
 

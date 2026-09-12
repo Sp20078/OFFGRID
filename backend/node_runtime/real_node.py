@@ -123,6 +123,17 @@ class RealNode:
         # ----------------------------------------------------------
         self.transport = UdpTransport(host, udp_port, self._handle_datagram)
 
+        # Dedicated listener for the shared discovery port: discovery
+        # announcements are broadcast to the well-known discovery port
+        # and every node must receive them. Each node's *transport*
+        # socket (data plane) stays on its own udp_port.
+        self._discovery_socket = UdpTransport(
+            host,
+            discovery_port,
+            self._handle_datagram,
+            reuse=True,
+        )
+
         self.discovery = DiscoveryService(
             transport=self.transport,
             node_id=node_id,
@@ -133,6 +144,7 @@ class RealNode:
             discovery_port=discovery_port,
             announce_interval=heartbeat_interval,
             heartbeat_timeout=heartbeat_timeout,
+            allowed_links=frozenset(frozenset(pair) for pair in links) if links else None,
         )
 
         # ----------------------------------------------------------
@@ -175,6 +187,21 @@ class RealNode:
             return
 
         await self.transport.start()
+
+        # Bind the shared discovery listener (best-effort: if another
+        # process holds the port without SO_REUSEPORT — e.g. on
+        # Windows — continue without it; discovery then relies on
+        # static peers or unicast to our transport port).
+        try:
+            await self._discovery_socket.start()
+        except OSError as exc:
+            logger.warning(
+                "[DISCOVERY] could not bind shared port %d (%s); "
+                "relying on static peers / unicast",
+                self.discovery_port,
+                exc,
+            )
+
         await self.discovery.start()
 
         # Register self in the shared registry (node identity is the
@@ -234,6 +261,7 @@ class RealNode:
             self._api_server = None
 
         await self.discovery.stop()
+        await self._discovery_socket.stop()
         await self.transport.stop()
 
         logger.info("[NODE] %s stopped", self.node_id)

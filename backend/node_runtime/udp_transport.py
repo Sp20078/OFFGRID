@@ -34,10 +34,13 @@ class UdpTransport:
     to the provided async handler as (raw_bytes, addr).
     """
 
-    def __init__(self, host: str, port: int, handler: ReceiveHandler):
+    def __init__(self, host: str, port: int, handler: ReceiveHandler, reuse: bool = False):
         self.host = host
         self.port = port  # updated to the bound port by start()
         self.handler = handler
+        # reuse: allow several processes on one machine to share the
+        # same UDP port (needed for the shared discovery port).
+        self.reuse = reuse
 
         self._transport: Optional[asyncio.DatagramTransport] = None
         self._running = False
@@ -49,10 +52,32 @@ class UdpTransport:
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
 
-        transport, _protocol = await loop.create_datagram_endpoint(
-            lambda: _UdpProtocol(self),
-            local_addr=(self.host, self.port),
-        )
+        if self.reuse:
+            # Pre-bind with SO_REUSEADDR/SO_REUSEPORT so multiple
+            # nodes on the same machine can all listen on the shared
+            # discovery port (one node per laptop does not need this,
+            # but same-laptop demos and tests do).
+            import socket as _socket
+
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+
+            if hasattr(_socket, "SO_REUSEPORT"):
+                try:
+                    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass
+
+            sock.bind((self.host, self.port))
+            transport, _protocol = await loop.create_datagram_endpoint(
+                lambda: _UdpProtocol(self),
+                sock=sock,
+            )
+        else:
+            transport, _protocol = await loop.create_datagram_endpoint(
+                lambda: _UdpProtocol(self),
+                local_addr=(self.host, self.port),
+            )
 
         self._transport = transport
         self._running = True
@@ -112,12 +137,14 @@ class UdpTransport:
         data = json.dumps(payload).encode("utf-8")
         return self.send_to(data, address)
 
-    def send_broadcast(self, data: bytes, port: int) -> bool:
+    def send_broadcast(self, data: bytes, port: int, host: str = "<broadcast>") -> bool:
         """
-        Send a datagram to the LAN broadcast address.
+        Send a datagram to a broadcast address.
 
         Uses SO_BROADCAST which is supported on both Windows
-        and Linux. <broadcast> resolves to 255.255.255.255.
+        and Linux. `host` defaults to <broadcast> (255.255.255.255)
+        but can be a directed broadcast such as 192.168.1.255 or
+        127.0.0.1 for same-machine demo nodes.
         """
         if self._transport is None:
             return False
@@ -139,7 +166,7 @@ class UdpTransport:
         except OSError as exc:
             logger.debug("Could not set SO_BROADCAST: %s", exc)
 
-        return self.send_to(data, ("<broadcast>", port))
+        return self.send_to(data, (host, port))
 
     # ------------------------------------------------------------------
     # Receiving (called by protocol)
