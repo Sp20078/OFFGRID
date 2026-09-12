@@ -92,6 +92,10 @@ class DiscoveryService:
         # node_id -> (ip, udp_port) of known peers.
         self.peers: dict[str, Tuple[str, int]] = {}
 
+        # Peers already announced as offline; prevents re-logging the
+        # same offline node every expiry tick (log spam).
+        self._offline_logged: set[str] = set()
+
     # ------------------------------------------------------------------
     # Local address helpers
     # ------------------------------------------------------------------
@@ -213,8 +217,6 @@ class DiscoveryService:
                                     often more reliable than the global one)
         - 127.0.0.1                 (lets several demo nodes share one laptop)
         """
-        payload = _dumps(self._announcement())
-
         targets = {"255.255.255.255", "127.0.0.1"}
 
         subnet_broadcast = self._subnet_broadcast()
@@ -223,6 +225,10 @@ class DiscoveryService:
             targets.add(subnet_broadcast)
 
         while self._running:
+            # Rebuild EVERY tick: the payload carries a gossip
+            # snapshot of currently-known peers, which changes as
+            # discovery progresses.
+            payload = _dumps(self._announcement())
             for target in targets:
                 try:
                     self._send_announcement(payload, target)
@@ -345,7 +351,11 @@ class DiscoveryService:
 
             is_new = self.registry.get(gossip_id) is None
 
-            self.register_peer(gossip_id, str(gossip_ip), gossip_port)
+            # Second-hand knowledge: record address but do not fake
+            # liveness. The unicast introduction below makes the new
+            # peer send US a direct announcement, which is the
+            # first-hand confirmation that flips it ONLINE.
+            self.register_peer(gossip_id, str(gossip_ip), gossip_port, confirm=False)
 
             if is_new:
                 logger.info(
@@ -356,9 +366,39 @@ class DiscoveryService:
                     node_id,
                 )
 
-    def register_peer(self, node_id: str, ip: str, udp_port: int) -> None:
+                # Introduce ourselves immediately by unicast so the
+                # new peer learns US too — otherwise it only knows us
+                # second-hand and (with no direct path) keeps marking
+                # us offline while we mark it online. Sent to the
+                # peer's transport port (exclusively bound, unlike the
+                # shared discovery port).
+                try:
+                    self.transport.send_to(
+                        _dumps(self._announcement()),
+                        (str(gossip_ip), gossip_port),
+                    )
+                except OSError:
+                    logger.debug(
+                        "Gossip introduction to %s failed", gossip_id
+                    )
+
+    def register_peer(
+        self,
+        node_id: str,
+        ip: str,
+        udp_port: int,
+        confirm: bool = True,
+    ) -> None:
         """
         Register or refresh a peer in the shared registry/topology.
+
+        confirm=True  -> first-hand evidence (direct announcement,
+                         data packet, or gossip introduction reply):
+                         refreshes last_seen / flips ONLINE.
+        confirm=False -> second-hand gossip knowledge only: records
+                         the address so we can reach the peer, but
+                         does NOT fake liveness (no ONLINE flapping
+                         for nodes we have never heard from).
 
         Also updates topology edges for all known peers of that node:
         in real mode a discovered node is directly reachable, so it
@@ -371,11 +411,19 @@ class DiscoveryService:
         if existing is not None:
             existing.address = ip
             existing.port = udp_port
-            existing.mark_seen()
+
+            if confirm:
+                existing.mark_seen()
+                self._offline_logged.discard(node_id)
         else:
-            self.registry.add(
-                Node(node_id=node_id, address=ip, port=udp_port)
-            )
+            node = Node(node_id=node_id, address=ip, port=udp_port)
+
+            if not confirm:
+                # Gossip-learned: start OFFLINE until we hear from
+                # the node itself.
+                node.mark_offline()
+
+            self.registry.add(node)
 
         self.peers[node_id] = (ip, udp_port)
 
@@ -462,13 +510,21 @@ class DiscoveryService:
             if node.node_id == self.node_id:
                 continue
 
-            if node.is_online() or node.node_id not in self.peers:
+            if node.is_online():
+                self._offline_logged.discard(node.node_id)
+                continue
+
+            if node.node_id not in self.peers:
                 continue
 
             self.topology.disconnect(self.node_id, node.node_id)
-            went_offline.append(node.node_id)
 
-            logger.warning("[HEARTBEAT] %s offline (timeout)", node.node_id)
+            # Log/announce the transition only once, not every tick.
+            if node.node_id not in self._offline_logged:
+                self._offline_logged.add(node.node_id)
+                went_offline.append(node.node_id)
+
+                logger.warning("[HEARTBEAT] %s offline (timeout)", node.node_id)
 
         return went_offline
 
