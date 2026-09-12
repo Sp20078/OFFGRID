@@ -282,7 +282,31 @@ def test_heartbeat_expiry_marks_offline_and_disconnects():
     assert went_offline == ["NODE_B"]
     assert not node_b.is_online()
     assert not discovery.topology.has_connection("NODE_A", "NODE_B")
-    assert "NODE_B" not in discovery.peers
+    # Address is kept so unicast announcements keep flowing to the
+    # stale address and the pair re-registers when the peer returns.
+    assert discovery.peers["NODE_B"] == ("192.168.1.102", 9002)
+
+
+def test_expired_peer_reRegisters_on_next_announcement():
+    discovery = _make_discovery()
+    discovery.register_peer("NODE_B", "192.168.1.102", 9002)
+
+    node_b = discovery.registry.get("NODE_B")
+    node_b.last_seen = time() - 100
+
+    assert discovery.expire_stale_peers() == ["NODE_B"]
+    assert not node_b.is_online()
+
+    # Peer laptop comes back: one announcement heals the pair.
+    asyncio.run(
+        discovery.handle_datagram(
+            _announcement("NODE_B", "192.168.1.102", 9002),
+            ("192.168.1.102", 9002),
+        )
+    )
+
+    assert node_b.is_online()
+    assert discovery.topology.has_connection("NODE_A", "NODE_B")
 
 
 def test_local_ip_returns_string():

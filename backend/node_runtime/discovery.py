@@ -362,6 +362,12 @@ class DiscoveryService:
         Mark peers that have not been heard from as OFFLINE and
         disconnect them from the topology so routing avoids them.
 
+        Their socket addresses are deliberately KEPT in
+        self.peers: unicast announcements continue to go to that
+        address, so when the laptop comes back (same IP) the very
+        next announcement re-registers it and the mesh heals
+        itself without waiting for broadcast.
+
         Returns the node ids that went offline this round.
         """
         # Existing HeartbeatManager marks stale nodes offline.
@@ -377,7 +383,6 @@ class DiscoveryService:
                 continue
 
             self.topology.disconnect(self.node_id, node.node_id)
-            self.peers.pop(node.node_id, None)
             went_offline.append(node.node_id)
 
             logger.warning("[HEARTBEAT] %s offline (timeout)", node.node_id)
