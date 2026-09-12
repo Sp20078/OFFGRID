@@ -9,6 +9,9 @@ export interface MeshNode {
   storedPacketsCount: number;
   x: number;
   y: number;
+  neighbors: string[];
+  lastSeenMs: number;
+  hardwareInfo?: string;
 }
 
 export interface MeshLink {
@@ -29,8 +32,16 @@ export interface NetworkLog {
 export interface NetworkMetrics {
   totalNodes: number;
   activeNodes: number;
+  activeLinksCount: number;
   activePathHops: string[];
   internetAvailable: boolean;
   storeAndForwardQueueSize: number;
   avgMeshLatencyMs: number;
+}
+
+export interface TransferState {
+  isTransferring: boolean;
+  transferType: 'MESSAGE' | 'FILE' | null;
+  transferProgress: number;
+  messageQueue: number;
 }
