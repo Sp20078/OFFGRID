@@ -104,6 +104,51 @@ export function fetchHealth(baseUrl: string): Promise<{ status: string; nodeId: 
   return request<{ status: string; nodeId: string }>(baseUrl, '/health');
 }
 
+export interface LiveStateNode {
+  id: string;
+  status: 'ONLINE' | 'OFFLINE';
+  ip: string;
+}
+
+export interface LiveStateMessage {
+  message_id?: string;
+  messageId?: string;
+  source: string;
+  destination: string;
+  payload?: string;
+  text?: string;
+  status: string;
+  created_at?: number;
+  createdAt?: number;
+}
+
+export interface LiveStateEvent {
+  id: string;
+  timestamp: string;
+  level: string;
+  message: string;
+  nodeId?: string | null;
+}
+
+export interface LiveState {
+  nodeId: string;
+  nodes: LiveStateNode[];
+  messages: LiveStateMessage[];
+  inbox: Array<{
+    message_id: string;
+    source: string;
+    destination: string;
+    text: string;
+    hop_count: number;
+    received_at: number;
+  }>;
+  events: LiveStateEvent[];
+}
+
+export function fetchLiveState(baseUrl: string): Promise<LiveState> {
+  return request<LiveState>(baseUrl, '/state');
+}
+
 export function sendRealMessage(
   baseUrl: string,
   destination: string,

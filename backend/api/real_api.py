@@ -115,6 +115,37 @@ def create_app(node) -> FastAPI:
     async def get_events() -> list[dict[str, Any]]:
         return list(node.events)[-100:]
 
+    @app.get("/state")
+    async def get_state() -> dict[str, Any]:
+        """
+        Compact live-state poll for the dashboard: this node's id,
+        every known node's status, the full message store (sent
+        message lifecycle: PENDING/FORWARDED/DELIVERED), recent
+        inbox deliveries and recent log events.
+        """
+        nodes = [
+            {
+                "id": n.node_id,
+                "status": (
+                    "ONLINE"
+                    if (n.node_id == node.node_id or n.is_online())
+                    else "OFFLINE"
+                ),
+                "ip": n.address,
+            }
+            for n in node.registry.all_nodes()
+        ]
+
+        return {
+            "nodeId": node.node_id,
+            "nodes": nodes,
+            "messages": [
+                m.to_dict() for m in node.delivery_manager.store.all()
+            ],
+            "inbox": list(node.relay.inbox)[-20:],
+            "events": list(node.events)[-50:],
+        }
+
     # ------------------------------------------------------------------
     # Peers / routes
     # ------------------------------------------------------------------

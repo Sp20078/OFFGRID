@@ -374,6 +374,16 @@ class PacketRelay:
         if address is None:
             address = self.next_hop_address(packet.source)
 
+        if address is None and self.discovery is not None:
+            # Direct-delivery fallback: for a 0-hop message there is
+            # no recorded path and the topology route back may not
+            # exist yet (announcement still in flight) — but if we
+            # know the source's socket address, ACK straight to it.
+            address = self.discovery.peers.get(packet.source)
+
+            if address is not None:
+                next_hop = packet.source
+
         if address is None:
             logger.warning(
                 "[ROUTE] cannot ACK %s: no route back to source",

@@ -63,6 +63,7 @@ class DiscoveryService:
         announce_interval: float = 2.0,
         heartbeat_timeout: float = 6.0,
         allowed_links: Optional[set] = None,
+        bind_host: str = "0.0.0.0",
     ):
         self.transport = transport
         self.node_id = node_id
@@ -73,6 +74,7 @@ class DiscoveryService:
         self.discovery_port = discovery_port
         self.announce_interval = announce_interval
         self.heartbeat_timeout = heartbeat_timeout
+        self.bind_host = bind_host
         # When set (from --links), only these node-id pairs are
         # topology neighbors; otherwise discovery forms a full mesh.
         self.allowed_links = allowed_links
@@ -158,13 +160,24 @@ class DiscoveryService:
     # Announcing
     # ------------------------------------------------------------------
 
+    def advertised_ip(self) -> str:
+        """
+        The IP we advertise in announcements.
+
+        For a 0.0.0.0 bind (the normal laptop case) that is the
+        machine's LAN IP. For a specific bind (loopback tests) it is
+        that bind address — advertising the LAN IP for a loopback
+        socket would give peers an address they cannot reach.
+        """
+        if self.bind_host not in ("0.0.0.0", "::", ""):
+            return self.bind_host
+        return self.local_ip()
+
     def _announcement(self) -> dict:
         return {
             "packet_type": "DISCOVERY",
             "node_id": self.node_id,
-            "ip": self.registry.get(self.node_id).address
-            if self.registry.get(self.node_id)
-            else self.local_ip(),
+            "ip": self.advertised_ip(),
             "udp_port": self.udp_port,
             "api_port": self.api_port,
             "timestamp": time(),
@@ -283,7 +296,7 @@ class DiscoveryService:
             # Our own broadcast echoed back — ignore.
             return
 
-        ip = message.get("ip") or addr[0]
+        ip = addr[0] or message.get("ip")
         udp_port = message.get("udp_port") or addr[1]
 
         if not isinstance(udp_port, int) or not (0 < udp_port < 65536):

@@ -2,7 +2,25 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { MeshNode, MeshLink, NetworkLog, NetworkMetrics, TransferState } from '@/types/network';
-import { RealNodeSnapshot, RealNodeSnapshotLog, fetchSnapshot, sendRealMessage } from '@/lib/realNodeApi';
+import {
+  RealNodeSnapshot,
+  RealNodeSnapshotLog,
+  fetchSnapshot,
+  fetchLiveState,
+  sendRealMessage,
+  LiveStateMessage,
+} from '@/lib/realNodeApi';
+
+/** Lifecycle row for a message this dashboard sent or received. */
+export interface MessageTrackedEvent {
+  id: string;
+  source: string;
+  destination: string;
+  text: string;
+  status: 'PENDING' | 'FORWARDED' | 'DELIVERED' | 'FAILED' | 'RECEIVED';
+  timestamp: string;
+  hopCount?: number;
+}
 
 const INITIAL_NODES: MeshNode[] = [
   { id: 'NODE_A', label: 'Node A (Origin)', status: 'ONLINE', ip: '10.0.0.1', latencyMs: 12, storedPacketsCount: 0, x: 14, y: 50, neighbors: ['Node B'], lastSeenMs: 1 },
@@ -51,6 +69,10 @@ export function useNetworkState() {
   const [logs, setLogs] = useState<NetworkLog[]>(INITIAL_LOGS);
   const [liveMode, setLiveMode] = useState<boolean>(false);
   const [sendingMessage, setSendingMessage] = useState<boolean>(false);
+  const [messageEvents, setMessageEvents] = useState<MessageTrackedEvent[]>([]);
+  const prevStatusesRef = useRef<Map<string, string>>(new Map());
+  const prevNodeStatesRef = useRef<Map<string, string>>(new Map());
+  const seenInboxRef = useRef<Set<string>>(new Set());
   const [transferState, setTransferState] = useState<TransferState>({
     isTransferring: false,
     transferType: null,
@@ -64,6 +86,14 @@ export function useNetworkState() {
     return () => {
       if (transferIntervalRef.current) clearInterval(transferIntervalRef.current);
     };
+  }, []);
+
+  const upsertMessageEvent = useCallback((event: MessageTrackedEvent) => {
+    setMessageEvents(prev => {
+      const next = prev.filter(e => e.id !== event.id);
+      next.unshift(event);
+      return next.slice(0, 30);
+    });
   }, []);
 
   const addLog = useCallback((message: string, level: NetworkLog['level'], nodeId?: string) => {
@@ -132,6 +162,126 @@ export function useNetworkState() {
       clearInterval(interval);
     };
   }, []);
+
+  // ------------------------------------------------------------------
+  // REAL-TIME STATE: node activations + message lifecycle.
+  // Polls GET /state (lightweight) at high frequency and diffs it
+  // locally to produce events:
+  //   "NODE_B activated (ONLINE)" / "NODE_C went OFFLINE"
+  //   "Message to NODE_B: PENDING -> FORWARDED -> DELIVERED"
+  //   "Message received from NODE_A: 'Hello'"
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const baseUrl = realNodeUrlRef.current;
+    if (!baseUrl) return;
+
+    let cancelled = false;
+    let firstPoll = true;
+
+    const statusToEventLevel = (s: string): NetworkLog['level'] =>
+      s === 'ONLINE' ? 'SUCCESS' : 'ERROR';
+
+    const pollState = async () => {
+      try {
+        const state = await fetchLiveState(baseUrl);
+        if (cancelled) return;
+
+        setLiveMode(true);
+
+        // ---- Node activation diff --------------------------------
+        const prevNodes = prevNodeStatesRef.current;
+
+        for (const n of state.nodes) {
+          const before = prevNodes.get(n.id);
+
+          if (before !== n.status) {
+            prevNodes.set(n.id, n.status);
+
+            if (!firstPoll) {
+              if (n.status === 'ONLINE') {
+                addLog(`${n.id} ACTIVATED — heartbeat link established`, 'SUCCESS', n.id);
+              } else {
+                addLog(`${n.id} went OFFLINE — heartbeat lost`, 'ERROR', n.id);
+              }
+            }
+          }
+        }
+
+        // ---- Message lifecycle diff ------------------------------
+        const prevStatuses = prevStatusesRef.current;
+        const now = new Date();
+
+        for (const m of state.messages ?? []) {
+          const id = m.message_id ?? m.messageId ?? '';
+          if (!id) continue;
+
+          const before = prevStatuses.get(id);
+          const current = m.status as MessageTrackedEvent['status'];
+
+          if (before !== current) {
+            prevStatuses.set(id, current);
+
+            upsertMessageEvent({
+              id,
+              source: m.source,
+              destination: m.destination,
+              text: m.payload ?? m.text ?? '',
+              status: (['PENDING', 'FORWARDED', 'DELIVERED', 'FAILED'].includes(current)
+                ? current
+                : 'PENDING') as MessageTrackedEvent['status'],
+              timestamp: formatTimestamp(now),
+            });
+
+            if (!firstPoll) {
+              if (current === 'DELIVERED') {
+                addLog(`ACK received — message to ${m.destination} DELIVERED ✓`, 'SUCCESS', m.destination);
+              } else if (current === 'FORWARDED') {
+                addLog(`Message to ${m.destination} transmitted over UDP mesh`, 'INFO', m.destination);
+              } else if (current === 'PENDING') {
+                addLog(`Message to ${m.destination} queued (destination unreachable)`, 'WARN', m.destination);
+              }
+            }
+          }
+        }
+
+        // ---- Received messages (this node's inbox) ---------------
+        for (const item of state.inbox ?? []) {
+          if (seenInboxRef.current.has(item.message_id)) continue;
+
+          seenInboxRef.current.add(item.message_id);
+
+          upsertMessageEvent({
+            id: item.message_id,
+            source: item.source,
+            destination: item.destination,
+            text: item.text,
+            status: 'RECEIVED',
+            timestamp: formatTimestamp(new Date(item.received_at * 1000)),
+            hopCount: item.hop_count,
+          });
+
+          if (!firstPoll) {
+            addLog(
+              `Message RECEIVED from ${item.source}: "${item.text}" (hops=${item.hop_count})`,
+              'SUCCESS',
+              item.source
+            );
+          }
+        }
+
+        firstPoll = false;
+      } catch {
+        // node unreachable — liveMode flips back via the topology poll
+      }
+    };
+
+    pollState();
+    const interval = setInterval(pollState, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [addLog, upsertMessageEvent]);
 
   const sendMessageToNode = useCallback(
     async (destination: string, payload: string): Promise<boolean> => {
@@ -383,6 +533,7 @@ export function useNetworkState() {
     liveMode,
     sendingMessage,
     sendMessageToNode,
+    messageEvents,
     actions: {
       toggleInternet,
       killNode,

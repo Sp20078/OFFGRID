@@ -8,6 +8,7 @@ import { NodeInspector } from '@/components/inspector/NodeInspector';
 import { SimulatorDeck } from '@/components/simulator/SimulatorDeck';
 import { ActivityBar } from '@/components/activity/ActivityBar';
 import { EventStream } from '@/components/telemetry/EventStream';
+import { LiveStatus } from '@/components/live/LiveStatus';
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<NavTab>('network');
@@ -24,6 +25,7 @@ export default function Home() {
     liveMode,
     sendingMessage,
     sendMessageToNode,
+    messageEvents,
     actions
   } = useNetworkState();
 
@@ -70,6 +72,9 @@ export default function Home() {
               onRestoreNode={actions.restoreNode}
               onResetNetwork={actions.resetNetwork}
             />
+
+            {/* Live node activation + message tracker (real mode) */}
+            <LiveStatus nodes={nodes} messageEvents={messageEvents} liveMode={liveMode} />
           </div>
         )}
 

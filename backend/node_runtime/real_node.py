@@ -145,6 +145,7 @@ class RealNode:
             announce_interval=heartbeat_interval,
             heartbeat_timeout=heartbeat_timeout,
             allowed_links=frozenset(frozenset(pair) for pair in links) if links else None,
+            bind_host=host,
         )
 
         # ----------------------------------------------------------
