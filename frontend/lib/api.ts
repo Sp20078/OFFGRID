@@ -1,151 +1,174 @@
 const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL ?? 'http://127.0.0.1:8000';
+  process.env.NEXT_PUBLIC_API_URL ??
+  'http://127.0.0.1:8000';
 
-export async function getNodes() {
-  const response = await fetch(`${API_BASE}/nodes`, {
-    cache: 'no-store',
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch nodes: ${response.status}`);
-  }
-
-  return response.json();
-}
-
-export async function getTopology() {
-  const response = await fetch(`${API_BASE}/network/topology`, {
-    cache: 'no-store',
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch topology: ${response.status}`);
-  }
-
-  return response.json();
-}
-
-export async function getRoute(destination: string) {
-  const response = await fetch(`${API_BASE}/routes/${destination}`, {
-    cache: 'no-store',
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch route: ${response.status}`);
-  }
-
-  return response.json();
-}
-
-export async function getMetrics() {
-  const response = await fetch(`${API_BASE}/metrics`, {
-    cache: 'no-store',
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch metrics: ${response.status}`);
-  }
-
-  return response.json();
-}
-
-export async function getEvents() {
-  const response = await fetch(`${API_BASE}/events`, {
-    cache: 'no-store',
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch events: ${response.status}`);
-  }
-
-  return response.json();
-}
-
-export async function killNode(nodeId: string) {
+async function request<T>(
+  path: string,
+  options?: RequestInit,
+): Promise<T> {
   const response = await fetch(
-    `${API_BASE}/network/simulate/node/${nodeId}/kill`,
+    `${API_BASE}${path}`,
     {
-      method: 'POST',
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(options?.headers ?? {}),
+      },
+      cache: 'no-store',
     },
   );
 
   if (!response.ok) {
-    throw new Error(`Failed to kill node: ${response.status}`);
+    let message = `HTTP ${response.status}`;
+
+    try {
+      const body = await response.json();
+
+      if (body?.detail) {
+        message = body.detail;
+      } else if (body?.message) {
+        message = body.message;
+      }
+    } catch {
+      // Ignore non-JSON error responses.
+    }
+
+    throw new Error(message);
   }
 
   return response.json();
 }
 
-export async function restoreNode(nodeId: string) {
-  const response = await fetch(
-    `${API_BASE}/network/simulate/node/${nodeId}/restore`,
+// -----------------------------------------------------------------------------
+// Nodes
+// -----------------------------------------------------------------------------
+
+export function getNodes() {
+  return request<any[]>('/nodes');
+}
+
+export function getNode(nodeId: string) {
+  return request<any>(
+    `/nodes/${encodeURIComponent(nodeId)}`,
+  );
+}
+
+// -----------------------------------------------------------------------------
+// Topology
+// -----------------------------------------------------------------------------
+
+export function getTopology() {
+  return request<any>('/network/topology');
+}
+
+export function getRoute(destination: string) {
+  return request<any>(
+    `/routes/${encodeURIComponent(destination)}`,
+  );
+}
+
+// -----------------------------------------------------------------------------
+// Metrics / events
+// -----------------------------------------------------------------------------
+
+export function getMetrics() {
+  return request<any>('/metrics');
+}
+
+export function getEvents() {
+  return request<any[]>('/events');
+}
+
+// -----------------------------------------------------------------------------
+// Node simulation
+// -----------------------------------------------------------------------------
+
+export function killNode(nodeId: string) {
+  return request<any>(
+    `/node/${encodeURIComponent(nodeId)}/kill`,
     {
       method: 'POST',
     },
   );
-
-  if (!response.ok) {
-    throw new Error(`Failed to restore node: ${response.status}`);
-  }
-
-  return response.json();
 }
 
-export async function toggleInternet(online: boolean) {
-  const endpoint = online
+export function restoreNode(nodeId: string) {
+  return request<any>(
+    `/node/${encodeURIComponent(nodeId)}/restore`,
+    {
+      method: 'POST',
+    },
+  );
+}
+
+// -----------------------------------------------------------------------------
+// Internet simulation
+// -----------------------------------------------------------------------------
+
+export function toggleInternet(
+  enabled: boolean,
+) {
+  const endpoint = enabled
     ? '/network/simulate/connect'
     : '/network/simulate/disconnect';
 
-  const response = await fetch(`${API_BASE}${endpoint}`, {
+  return request<any>(endpoint, {
     method: 'POST',
   });
-
-  if (!response.ok) {
-    throw new Error(`Failed to change internet state: ${response.status}`);
-  }
-
-  return response.json();
 }
 
-export async function resetNetwork() {
-  const response = await fetch(`${API_BASE}/network/reset`, {
+// -----------------------------------------------------------------------------
+// Reset
+// -----------------------------------------------------------------------------
+
+export function resetNetwork() {
+  return request<any>('/reset', {
     method: 'POST',
   });
-
-  if (!response.ok) {
-    throw new Error(`Failed to reset network: ${response.status}`);
-  }
-
-  return response.json();
 }
 
-export async function sendMessage(
+// -----------------------------------------------------------------------------
+// Messages
+// -----------------------------------------------------------------------------
+
+export function sendMessage(
   source: string,
   destination: string,
   payload: string,
 ) {
-  const response = await fetch(`${API_BASE}/messages`, {
+  return request<any>('/messages', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
     body: JSON.stringify({
       source,
       destination,
       payload,
     }),
   });
-
-  if (!response.ok) {
-    throw new Error(`Failed to send message: ${response.status}`);
-  }
-
-  return response.json();
 }
 
-export function getWebSocketUrl() {
-  const httpBase =
-    process.env.NEXT_PUBLIC_API_URL ?? 'http://127.0.0.1:8000';
+// -----------------------------------------------------------------------------
+// WebSocket
+// -----------------------------------------------------------------------------
 
-  return httpBase.replace(/^http/, 'ws') + '/ws/network';
+export function getWebSocketUrl() {
+  if (
+    typeof window !== 'undefined'
+  ) {
+    const protocol =
+      window.location.protocol ===
+      'https:'
+        ? 'wss:'
+        : 'ws:';
+
+    return `${protocol}//${window.location.hostname}:8000/ws/network`;
+  }
+
+  const httpBase =
+    process.env.NEXT_PUBLIC_API_URL ??
+    'http://127.0.0.1:8000';
+
+  return (
+    httpBase.replace(/^http/, 'ws') +
+    '/ws/network'
+  );
 }

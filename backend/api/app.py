@@ -1,14 +1,22 @@
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.messaging.delivery import DeliveryManager
 from backend.messaging.network_adapter import NetworkAdapter
+from backend.network.heartbeat import HeartbeatManager
 from backend.network.network import NetworkEngine
 from backend.network.node import Node, NodeStatus
 from backend.network.registry import NodeRegistry
@@ -21,15 +29,19 @@ from backend.network.topology import NetworkTopology
 # =============================================================================
 
 app = FastAPI(
-    title="OFFGRID API",
-    version="0.1.0",
+    title="OFFGRID",
+    description="Local-first decentralized mesh network",
+    version="1.0.0",
 )
+
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -38,7 +50,36 @@ app.add_middleware(
 
 
 # =============================================================================
-# Global OFFGRID state
+# Request models
+# =============================================================================
+
+class MessageRequest(BaseModel):
+    source: str = Field(
+        default="NODE_A",
+        min_length=1,
+    )
+    destination: str = Field(
+        ...,
+        min_length=1,
+    )
+    payload: str = Field(
+        ...,
+        min_length=1,
+        max_length=5000,
+    )
+    ttl: int = Field(
+        default=10,
+        ge=1,
+        le=64,
+    )
+
+
+class InternetRequest(BaseModel):
+    enabled: bool
+
+
+# =============================================================================
+# Global network state
 # =============================================================================
 
 registry = NodeRegistry()
@@ -48,82 +89,48 @@ router = Router(
     registry=registry,
 )
 
+heartbeat = HeartbeatManager(
+    registry=registry,
+    timeout=15.0,
+)
+
 network_engine: NetworkEngine | None = None
 delivery_manager: DeliveryManager | None = None
 
-INTERNET_AVAILABLE = False
+internet_available = True
 
-EVENTS: list[dict[str, Any]] = []
+events: list[dict[str, Any]] = []
 
-connected_clients: set[WebSocket] = set()
+websocket_clients: set[WebSocket] = set()
 
-
-# =============================================================================
-# Demo node configuration
-# =============================================================================
-
-NODE_COORDINATES = {
-    "NODE_A": (14, 50),
-    "NODE_B": (32, 25),
-    "NODE_C": (50, 25),
-    "NODE_D": (68, 65),
-    "NODE_E": (86, 50),
-}
-
-NODE_LABELS = {
-    "NODE_A": "Node A (Origin)",
-    "NODE_B": "Node B (Relay 1)",
-    "NODE_C": "Node C (Relay 2)",
-    "NODE_D": "Node D (Relay 3)",
-    "NODE_E": "Node E (Target)",
-}
-
-NODE_IPS = {
-    "NODE_A": "10.0.0.1",
-    "NODE_B": "10.0.0.2",
-    "NODE_C": "10.0.0.3",
-    "NODE_D": "10.0.0.4",
-    "NODE_E": "10.0.0.5",
-}
-
-CANONICAL_DEMO_ROUTE = [
-    "NODE_A",
-    "NODE_B",
-    "NODE_C",
-    "NODE_D",
-    "NODE_E",
-]
-
-BACKUP_DEMO_ROUTE = [
-    "NODE_A",
-    "NODE_B",
-    "NODE_D",
-    "NODE_E",
-]
+# Simple lock around mutable API state.
+state_lock = asyncio.Lock()
 
 
 # =============================================================================
-# Request models
+# Utilities
 # =============================================================================
 
-class MessageRequest(BaseModel):
-    source: str = "NODE_A"
-    destination: str = "NODE_E"
-    payload: str
+def utc_now() -> str:
+    return datetime.now(
+        timezone.utc,
+    ).isoformat()
 
-
-# =============================================================================
-# Events
-# =============================================================================
 
 def add_event(
     level: str,
     message: str,
     node_id: str | None = None,
 ) -> dict[str, Any]:
-    event = {
-        "id": str(len(EVENTS) + 1),
-        "timestamp": datetime.now().strftime("%H:%M:%S"),
+    """
+    Add a uniquely identified event.
+
+    UUIDs are used instead of len(events)+1 so the frontend
+    never receives duplicate React keys.
+    """
+    event: dict[str, Any] = {
+        "id": str(uuid.uuid4()),
+        "timestamp": utc_now(),
         "level": level,
         "message": message,
     }
@@ -131,12 +138,364 @@ def add_event(
     if node_id is not None:
         event["nodeId"] = node_id
 
-    EVENTS.insert(0, event)
+    events.append(event)
 
-    # Keep the UI event stream bounded.
-    del EVENTS[50:]
+    # Keep memory bounded.
+    if len(events) > 200:
+        del events[:-200]
 
     return event
+
+
+def node_to_frontend(node: Node) -> dict[str, Any]:
+    """
+    Convert backend Node to the structure expected by the
+    Next.js dashboard.
+    """
+    # Fixed demo positions.
+    positions: dict[str, tuple[float, float]] = {
+        "NODE_A": (10.0, 50.0),
+        "NODE_B": (30.0, 25.0),
+        "NODE_C": (50.0, 50.0),
+        "NODE_D": (70.0, 25.0),
+        "NODE_E": (90.0, 50.0),
+    }
+
+    labels = {
+        "NODE_A": "Node A",
+        "NODE_B": "Node B",
+        "NODE_C": "Node C",
+        "NODE_D": "Node D",
+        "NODE_E": "Node E",
+    }
+
+    x, y = positions.get(
+        node.node_id,
+        (50.0, 50.0),
+    )
+
+    node_status = (
+        "ONLINE"
+        if node.status == NodeStatus.ONLINE
+        else "OFFLINE"
+    )
+
+    # Determine neighbor list from topology.
+    neighbors = sorted(
+        topology.neighbors(
+            node.node_id,
+        ),
+    )
+
+    latency = 20.0 if node_status == "ONLINE" else 0.0
+
+    stored_packets = 0
+
+    if delivery_manager is not None:
+        try:
+            stored_packets = len(
+                delivery_manager.queue.get_for_destination(
+                    node.node_id,
+                )
+            )
+        except Exception:
+            stored_packets = 0
+
+    now_ms = int(
+        datetime.now(
+            timezone.utc,
+        ).timestamp()
+        * 1000
+    )
+
+    if node.last_seen is not None:
+        try:
+            last_seen_ms = int(
+                node.last_seen.timestamp()
+                * 1000
+            )
+        except Exception:
+            last_seen_ms = now_ms
+    else:
+        last_seen_ms = now_ms
+
+    return {
+        "id": node.node_id,
+        "label": labels.get(
+            node.node_id,
+            node.node_id,
+        ),
+        "status": node_status,
+        "ip": node.address,
+        "latencyMs": latency,
+        "storedPacketsCount": stored_packets,
+        "x": x,
+        "y": y,
+        "neighbors": neighbors,
+        "lastSeenMs": last_seen_ms,
+    }
+
+
+def get_frontend_nodes() -> list[dict[str, Any]]:
+    return [
+        node_to_frontend(node)
+        for node in registry.all_nodes()
+    ]
+
+
+def get_frontend_links() -> list[dict[str, Any]]:
+    links: list[dict[str, Any]] = []
+
+    graph = topology.get_graph()
+
+    seen: set[tuple[str, str]] = set()
+
+    for source, neighbors in graph.items():
+        for target in neighbors:
+            key = tuple(
+                sorted(
+                    (source, target),
+                )
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            source_node = registry.get(
+                source,
+            )
+            target_node = registry.get(
+                target,
+            )
+
+            if (
+                source_node is None
+                or target_node is None
+            ):
+                continue
+
+            active = (
+                source_node.is_online()
+                and target_node.is_online()
+            )
+
+            links.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "active": active,
+                    "quality": 1.0
+                    if active
+                    else 0.0,
+                }
+            )
+
+    return links
+
+
+# =============================================================================
+# Deterministic demo routing
+# =============================================================================
+
+def get_active_route(
+    source: str = "NODE_A",
+    destination: str = "NODE_E",
+) -> list[str]:
+    """
+    Preserve the canonical demo route when healthy:
+
+        A -> B -> C -> D -> E
+
+    When C is offline:
+
+        A -> B -> D -> E
+
+    Otherwise fall back to the actual BFS router.
+    """
+    canonical = [
+        "NODE_A",
+        "NODE_B",
+        "NODE_C",
+        "NODE_D",
+        "NODE_E",
+    ]
+
+    if source == "NODE_A" and destination == "NODE_E":
+        all_online = all(
+            (
+                registry.get(node_id)
+                is not None
+                and registry.get(
+                    node_id
+                ).is_online()
+            )
+            for node_id in canonical
+        )
+
+        if all_online:
+            return canonical
+
+        node_c = registry.get("NODE_C")
+
+        if (
+            node_c is None
+            or not node_c.is_online()
+        ):
+            backup = [
+                "NODE_A",
+                "NODE_B",
+                "NODE_D",
+                "NODE_E",
+            ]
+
+            if all(
+                registry.get(node_id)
+                is not None
+                and registry.get(
+                    node_id
+                ).is_online()
+                for node_id in backup
+            ):
+                return backup
+
+    route = router.find_route(
+        source,
+        destination,
+    )
+
+    return route or []
+
+
+def resolve_route(
+    source: str,
+    destination: str,
+) -> list[str]:
+    return get_active_route(
+        source,
+        destination,
+    )
+
+
+# =============================================================================
+# Metrics
+# =============================================================================
+
+def get_metrics_payload() -> dict[str, Any]:
+    nodes = registry.all_nodes()
+
+    active_nodes = [
+        node
+        for node in nodes
+        if node.is_online()
+    ]
+
+    links = get_frontend_links()
+
+    active_links = [
+        link
+        for link in links
+        if link["active"]
+    ]
+
+    route = get_active_route()
+
+    queue_size = 0
+
+    if delivery_manager is not None:
+        try:
+            queue_size = delivery_manager.queue.size()
+        except Exception:
+            queue_size = 0
+
+    avg_latency = 20.0 if active_nodes else 0.0
+
+    if network_engine is not None:
+        metrics = network_engine.get_metrics()
+    else:
+        metrics = {
+            "forwarded_packets": 0,
+            "delivered_packets": 0,
+        }
+
+    return {
+        "totalNodes": len(nodes),
+        "activeNodes": len(active_nodes),
+        "activeLinksCount": len(active_links),
+        "activePathHops": route,
+        "internetAvailable": internet_available,
+        "storeAndForwardQueueSize": queue_size,
+        "avgMeshLatencyMs": avg_latency,
+        "forwardedPackets": metrics.get(
+            "forwarded_packets",
+            0,
+        ),
+        "deliveredPackets": metrics.get(
+            "delivered_packets",
+            0,
+        ),
+    }
+
+
+def network_snapshot() -> dict[str, Any]:
+    route = get_active_route()
+
+    return {
+        "nodes": get_frontend_nodes(),
+        "links": get_frontend_links(),
+        "activeRoute": route,
+        "metrics": get_metrics_payload(),
+        "logs": list(events[-100:]),
+        "internetOnline": internet_available,
+    }
+
+
+# =============================================================================
+# WebSocket broadcast
+# =============================================================================
+
+async def broadcast_network_state() -> None:
+    if not websocket_clients:
+        return
+
+    payload = {
+        "type": "NETWORK_STATE",
+        "data": network_snapshot(),
+    }
+
+    dead_clients: list[WebSocket] = []
+
+    for websocket in list(
+        websocket_clients
+    ):
+        try:
+            await websocket.send_json(
+                payload
+            )
+        except Exception:
+            dead_clients.append(
+                websocket
+            )
+
+    for websocket in dead_clients:
+        websocket_clients.discard(
+            websocket
+        )
+
+
+async def emit_event(
+    level: str,
+    message: str,
+    node_id: str | None = None,
+) -> None:
+    add_event(
+        level,
+        message,
+        node_id,
+    )
+
+    await broadcast_network_state()
 
 
 # =============================================================================
@@ -146,365 +505,166 @@ def add_event(
 def initialize_network() -> None:
     global network_engine
     global delivery_manager
+    global internet_available
 
-    registry.nodes.clear()
-    topology.connections.clear()
+    registry = globals()["registry"]
+    topology = globals()["topology"]
+    router = globals()["router"]
 
-    # -------------------------------------------------------------------------
-    # Create nodes
-    # -------------------------------------------------------------------------
+    # Clean previous state.
+    for node in registry.all_nodes():
+        registry.remove(node.node_id)
 
-    node_ids = list(NODE_COORDINATES.keys())
+    # Rebuild topology.
+    # NetworkTopology has no universal clear() contract in the
+    # existing code, so recreate it and update globals.
+    new_topology = NetworkTopology()
+    globals()["topology"] = new_topology
 
-    for index, node_id in enumerate(node_ids):
-        registry.add(
-            Node(
-                node_id=node_id,
-                address=NODE_IPS[node_id],
-                port=5000 + index,
-            )
+    topology = new_topology
+
+    router = Router(
+        topology=topology,
+        registry=registry,
+    )
+
+    globals()["router"] = router
+
+    # Demo addresses.
+    demo_nodes = [
+        Node(
+            node_id="NODE_A",
+            address="127.0.0.1",
+            port=9001,
+        ),
+        Node(
+            node_id="NODE_B",
+            address="127.0.0.1",
+            port=9002,
+        ),
+        Node(
+            node_id="NODE_C",
+            address="127.0.0.1",
+            port=9003,
+        ),
+        Node(
+            node_id="NODE_D",
+            address="127.0.0.1",
+            port=9004,
+        ),
+        Node(
+            node_id="NODE_E",
+            address="127.0.0.1",
+            port=9005,
+        ),
+    ]
+
+    for node in demo_nodes:
+        registry.add(node)
+        topology.add_node(
+            node.node_id
+        )
+        registry.mark_online(
+            node.node_id
         )
 
-    # -------------------------------------------------------------------------
-    # Normal path:
-    #
-    # A -> B -> C -> D -> E
-    # -------------------------------------------------------------------------
+    # Main path.
+    topology.connect(
+        "NODE_A",
+        "NODE_B",
+    )
+    topology.connect(
+        "NODE_B",
+        "NODE_C",
+    )
+    topology.connect(
+        "NODE_C",
+        "NODE_D",
+    )
+    topology.connect(
+        "NODE_D",
+        "NODE_E",
+    )
 
-    for source, target in [
-        ("NODE_A", "NODE_B"),
-        ("NODE_B", "NODE_C"),
-        ("NODE_C", "NODE_D"),
-        ("NODE_D", "NODE_E"),
-    ]:
-        topology.connect(source, target)
-
-    # -------------------------------------------------------------------------
-    # Backup path:
-    #
-    # B -> D
-    #
-    # This becomes active when C is offline.
-    # -------------------------------------------------------------------------
-
+    # Backup path.
     topology.connect(
         "NODE_B",
         "NODE_D",
     )
 
-    # -------------------------------------------------------------------------
-    # Build network engine
-    # -------------------------------------------------------------------------
-
-    node_a = registry.get("NODE_A")
-
-    if node_a is None:
-        raise RuntimeError("NODE_A was not created")
-
     network_engine = NetworkEngine(
-        node=node_a,
+        node=demo_nodes[0],
         registry=registry,
         topology=topology,
         router=router,
     )
 
-    # Adapter allows DeliveryManager to use the network layer
-    # without knowing its internal implementation.
-    adapter = NetworkAdapter(network_engine)
+    globals()[
+        "network_engine"
+    ] = network_engine
+
+    adapter = NetworkAdapter(
+        network_engine
+    )
 
     delivery_manager = DeliveryManager(
         router=adapter,
         max_retries=3,
     )
 
+    globals()[
+        "delivery_manager"
+    ] = delivery_manager
 
-# =============================================================================
-# Route helpers
-# =============================================================================
+    internet_available = True
 
-def _all_nodes_online(route: list[str]) -> bool:
-    for node_id in route:
-        node = registry.get(node_id)
+    events.clear()
 
-        if node is None or not node.is_online():
-            return False
-
-    return True
-
-
-def get_active_route() -> list[str]:
-    """
-    Deterministic demo route.
-
-    Healthy network:
-        A -> B -> C -> D -> E
-
-    C offline:
-        A -> B -> D -> E
-    """
-
-    if _all_nodes_online(CANONICAL_DEMO_ROUTE):
-        return CANONICAL_DEMO_ROUTE.copy()
-
-    if _all_nodes_online(BACKUP_DEMO_ROUTE):
-        return BACKUP_DEMO_ROUTE.copy()
-
-    # For any future topology, fall back to the real router.
-    route = router.find_route(
-        "NODE_A",
-        "NODE_E",
+    add_event(
+        "SUCCESS",
+        "OFFGRID network initialized.",
     )
 
-    return route or []
-
-
-def resolve_route(
-    source: str,
-    destination: str,
-) -> list[str] | None:
-    """
-    Resolve a route.
-
-    The presentation demo has a deterministic A -> E path:
-      A -> B -> C -> D -> E
-
-    and a deterministic fallback:
-      A -> B -> D -> E
-
-    Other source/destination combinations use the real router.
-    """
-
-    if (
-        source == "NODE_A"
-        and destination == "NODE_E"
-    ):
-        route = get_active_route()
-
-        return route or None
-
-    return router.find_route(
-        source,
-        destination,
+    add_event(
+        "INFO",
+        "Healthy route established: NODE_A → NODE_B → NODE_C → NODE_D → NODE_E.",
     )
 
-
-# =============================================================================
-# Snapshot helpers
-# =============================================================================
-
-def node_payload(node_id: str) -> dict[str, Any]:
-    node = registry.get(node_id)
-
-    if node is None:
-        raise KeyError(node_id)
-
-    x, y = NODE_COORDINATES[node_id]
-
-    neighbors = topology.neighbors(node_id)
-
-    status = (
-        "OFFLINE"
-        if node.status == NodeStatus.OFFLINE
-        else "ONLINE"
+    add_event(
+        "INFO",
+        "Backup route available through NODE_B → NODE_D.",
     )
-
-    return {
-        "id": node_id,
-        "label": NODE_LABELS[node_id],
-        "status": status,
-        "ip": node.address,
-        "latencyMs": 0 if status == "OFFLINE" else 20,
-        "storedPacketsCount": (
-            0
-            if delivery_manager is None
-            else len(
-                delivery_manager.pending_messages(node_id)
-            )
-        ),
-        "x": x,
-        "y": y,
-        "neighbors": [
-            NODE_LABELS.get(neighbor, neighbor)
-            for neighbor in neighbors
-        ],
-        "lastSeenMs": max(
-            0,
-            int(
-                (
-                    datetime.now().timestamp()
-                    - node.last_seen
-                )
-                * 1000
-            ),
-        ),
-    }
-
-
-def links_payload() -> list[dict[str, Any]]:
-    links: list[dict[str, Any]] = []
-
-    seen: set[tuple[str, str]] = set()
-
-    for source in topology.connections:
-        for target in topology.connections[source]:
-            pair = tuple(sorted((source, target)))
-
-            if pair in seen:
-                continue
-
-            seen.add(pair)
-
-            source_node = registry.get(source)
-            target_node = registry.get(target)
-
-            active = bool(
-                source_node
-                and target_node
-                and source_node.is_online()
-                and target_node.is_online()
-            )
-
-            links.append(
-                {
-                    "source": source,
-                    "target": target,
-                    "active": active,
-                    "quality": 100 if active else 0,
-                }
-            )
-
-    return links
-
-
-def get_queue_size() -> int:
-    if delivery_manager is None:
-        return 0
-
-    return len(
-        delivery_manager.pending_messages()
-    )
-
-
-def network_snapshot() -> dict[str, Any]:
-    nodes = [
-        node_payload(node_id)
-        for node_id in NODE_COORDINATES
-    ]
-
-    links = links_payload()
-
-    active_route = get_active_route()
-
-    active_nodes = [
-        node
-        for node in nodes
-        if node["status"] != "OFFLINE"
-    ]
-
-    active_links_count = sum(
-        1
-        for link in links
-        if link["active"]
-    )
-
-    active_latencies = [
-        node["latencyMs"]
-        for node in active_nodes
-        if node["latencyMs"] > 0
-    ]
-
-    avg_latency = (
-        round(
-            sum(active_latencies)
-            / len(active_latencies)
-        )
-        if active_latencies
-        else 0
-    )
-
-    return {
-        "nodes": nodes,
-        "links": links,
-        "activeRoute": active_route,
-        "internetOnline": INTERNET_AVAILABLE,
-        "metrics": {
-            "totalNodes": len(nodes),
-            "activeNodes": len(active_nodes),
-            "activeLinksCount": active_links_count,
-            "activePathHops": active_route,
-            "internetAvailable": INTERNET_AVAILABLE,
-            "storeAndForwardQueueSize": get_queue_size(),
-            "avgMeshLatencyMs": avg_latency,
-        },
-        "logs": EVENTS,
-    }
-
-
-# =============================================================================
-# WebSocket broadcasting
-# =============================================================================
-
-async def broadcast_state() -> None:
-    if not connected_clients:
-        return
-
-    payload = {
-        "type": "NETWORK_STATE",
-        "data": network_snapshot(),
-    }
-
-    disconnected: list[WebSocket] = []
-
-    for client in connected_clients:
-        try:
-            await client.send_json(payload)
-        except Exception:
-            disconnected.append(client)
-
-    for client in disconnected:
-        connected_clients.discard(client)
 
 
 # =============================================================================
 # Startup
 # =============================================================================
 
-initialize_network()
-
-add_event(
-    "INFO",
-    "OFFGRID Core initializing P2P discovery...",
-)
-
-add_event(
-    "SUCCESS",
-    "Initial mesh topology ready.",
-)
-
-add_event(
-    "SUCCESS",
-    "Primary route: A → B → C → D → E",
-)
+@app.on_event("startup")
+async def startup_event() -> None:
+    initialize_network()
 
 
 # =============================================================================
-# Basic endpoints
+# Root / health
 # =============================================================================
 
 @app.get("/")
-def root():
+async def root() -> dict[str, Any]:
     return {
-        "service": "OFFGRID",
-        "status": "online",
-        "docs": "/docs",
+        "name": "OFFGRID",
+        "status": "running",
+        "service": "decentralized mesh network",
     }
 
 
 @app.get("/health")
-def health():
+async def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "service": "offgrid",
+        "nodes": registry.count(),
+        "onlineNodes": registry.online_count(),
+        "internetAvailable": internet_available,
     }
 
 
@@ -513,19 +673,23 @@ def health():
 # =============================================================================
 
 @app.get("/nodes")
-def get_nodes():
-    return network_snapshot()["nodes"]
+async def get_nodes() -> list[dict[str, Any]]:
+    return get_frontend_nodes()
 
 
 @app.get("/nodes/{node_id}")
-def get_node(node_id: str):
-    if not registry.contains(node_id):
+async def get_node(
+    node_id: str,
+) -> dict[str, Any]:
+    node = registry.get(node_id)
+
+    if node is None:
         raise HTTPException(
             status_code=404,
-            detail="Node not found",
+            detail=f"Unknown node: {node_id}",
         )
 
-    return node_payload(node_id)
+    return node_to_frontend(node)
 
 
 # =============================================================================
@@ -533,13 +697,11 @@ def get_node(node_id: str):
 # =============================================================================
 
 @app.get("/network/topology")
-def get_topology():
-    snapshot = network_snapshot()
-
+async def get_topology() -> dict[str, Any]:
     return {
-        "nodes": snapshot["nodes"],
-        "links": snapshot["links"],
-        "activeRoute": snapshot["activeRoute"],
+        "nodes": get_frontend_nodes(),
+        "links": get_frontend_links(),
+        "activeRoute": get_active_route(),
     }
 
 
@@ -548,38 +710,60 @@ def get_topology():
 # =============================================================================
 
 @app.get("/routes")
-def get_routes():
-    return {
-        "routes": {
-            "NODE_E": get_active_route(),
-        }
-    }
+async def get_all_routes() -> dict[str, Any]:
+    routes: dict[str, list[str]] = {}
+
+    for node in registry.all_nodes():
+        if node.node_id == "NODE_A":
+            continue
+
+        routes[node.node_id] = resolve_route(
+            "NODE_A",
+            node.node_id,
+        )
+
+    return routes
 
 
 @app.get("/routes/{destination}")
-def get_route(destination: str):
+async def get_route(
+    destination: str,
+) -> dict[str, Any]:
+    if registry.get(destination) is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown destination: {destination}",
+        )
+
     route = resolve_route(
         "NODE_A",
         destination,
     )
 
     return {
-        "route": route or [],
+        "source": "NODE_A",
+        "destination": destination,
+        "route": route,
+        "reachable": bool(route),
     }
 
 
 # =============================================================================
-# Metrics / Events
+# Metrics
 # =============================================================================
 
 @app.get("/metrics")
-def get_metrics():
-    return network_snapshot()["metrics"]
+async def get_metrics() -> dict[str, Any]:
+    return get_metrics_payload()
 
+
+# =============================================================================
+# Events
+# =============================================================================
 
 @app.get("/events")
-def get_events():
-    return EVENTS
+async def get_events() -> list[dict[str, Any]]:
+    return list(events[-100:])
 
 
 # =============================================================================
@@ -587,39 +771,69 @@ def get_events():
 # =============================================================================
 
 @app.get("/messages")
-def get_messages():
+async def get_messages() -> dict[str, Any]:
     if delivery_manager is None:
-        return []
+        return {
+            "messages": [],
+            "count": 0,
+        }
 
-    return [
+    messages = [
         message.to_dict()
-        for message in delivery_manager.store.all()
+        for message in delivery_manager.pending_messages()
     ]
+
+    return {
+        "messages": messages,
+        "count": len(messages),
+    }
 
 
 @app.post("/messages")
-async def send_message(request: MessageRequest):
+async def post_message(
+    request: MessageRequest,
+) -> dict[str, Any]:
     if delivery_manager is None:
         raise HTTPException(
-            status_code=500,
-            detail="Messaging system is not initialized",
+            status_code=503,
+            detail="Messaging system not initialized",
         )
 
-    # -------------------------------------------------------------------------
-    # Create a real OFFGRID message
-    # -------------------------------------------------------------------------
+    source_node = registry.get(
+        request.source
+    )
+
+    destination_node = registry.get(
+        request.destination
+    )
+
+    if source_node is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown source node: {request.source}",
+        )
+
+    if destination_node is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Unknown destination node: "
+                f"{request.destination}"
+            ),
+        )
+
+    if not source_node.is_online():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Source node {request.source} is offline",
+        )
 
     message = delivery_manager.create_message(
         source=request.source,
         destination=request.destination,
         payload=request.payload,
-        ttl=8,
-        sequence=0,
+        ttl=request.ttl,
     )
-
-    # -------------------------------------------------------------------------
-    # Resolve route
-    # -------------------------------------------------------------------------
 
     route = resolve_route(
         request.source,
@@ -627,99 +841,101 @@ async def send_message(request: MessageRequest):
     )
 
     # -------------------------------------------------------------------------
-    # No route -> store and forward
+    # No route: store-and-forward.
     # -------------------------------------------------------------------------
 
-    if route is None:
-        delivery_manager.deliver(message)
-
-        add_event(
-            "WARN",
-            (
-                f"Destination {request.destination} unavailable. "
-                f"Message stored locally."
-            ),
+    if not route:
+        delivery_manager.deliver(
+            message
         )
 
-        await broadcast_state()
+        await emit_event(
+            "WARN",
+            (
+                f"Message {message.message_id} "
+                f"stored: no route to "
+                f"{request.destination}."
+            ),
+            request.source,
+        )
 
         return {
             "status": "PENDING",
-            "messageId": message.message_id,
+            "message_id": message.message_id,
+            "source": request.source,
+            "destination": request.destination,
+            "payload": request.payload,
             "route": [],
         }
 
     # -------------------------------------------------------------------------
-    # Use the exact route selected by the demo/router.
-    #
-    # This is important because DeliveryManager normally asks its router
-    # for a route again. Here we deliberately execute the route selected
-    # above so the dashboard and actual forwarding agree.
+    # Route exists.
     # -------------------------------------------------------------------------
 
-    if network_engine is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Network engine is not initialized",
-        )
-
-    delivered = network_engine.send_message(
+    success = network_engine.send_message(
         message,
         route,
     )
 
-    if not delivered:
-        delivery_manager.queue.store(message)
-
-        add_event(
-            "WARN",
-            (
-                f"Message {message.message_id} could not be delivered. "
-                f"Stored for retry."
-            ),
+    if success:
+        delivery_manager.store.mark_forwarded(
+            message.message_id
         )
 
-        await broadcast_state()
+        delivery_manager.acknowledge(
+            message.message_id
+        )
+
+        await emit_event(
+            "SUCCESS",
+            (
+                f"Message delivered "
+                f"{request.source} → "
+                f"{request.destination}: "
+                f"\"{request.payload}\""
+            ),
+            request.source,
+        )
+
+        await emit_event(
+            "INFO",
+            (
+                "Route used: "
+                + " → ".join(route)
+            ),
+            request.source,
+        )
 
         return {
-            "status": "PENDING",
-            "messageId": message.message_id,
+            "status": "DELIVERED",
+            "message_id": message.message_id,
+            "source": request.source,
+            "destination": request.destination,
+            "payload": request.payload,
             "route": route,
         }
 
-    # -------------------------------------------------------------------------
-    # Mark forwarded and then acknowledge.
-    # -------------------------------------------------------------------------
-
-    delivery_manager.store.mark_forwarded(
-        message.message_id
+    # Fallback to queue if sending failed.
+    delivery_manager.deliver(
+        message
     )
 
-    delivery_manager.acknowledge(
-        message.message_id
-    )
-
-    add_event(
-        "INFO",
+    await emit_event(
+        "WARN",
         (
-            f"Packet forwarding route: "
-            f"{' → '.join(route)}"
+            f"Message {message.message_id} "
+            f"could not be delivered and "
+            "was queued."
         ),
+        request.source,
     )
-
-    add_event(
-        "SUCCESS",
-        (
-            f"Message {message.message_id} delivered "
-            f"to {request.destination}."
-        ),
-    )
-
-    await broadcast_state()
 
     return {
-        "status": "DELIVERED",
-        "messageId": message.message_id,
+        "status": "PENDING",
+        "message_id": message.message_id,
+        "source": request.source,
+        "destination": request.destination,
+        "payload": request.payload,
         "route": route,
     }
 
@@ -729,63 +945,75 @@ async def send_message(request: MessageRequest):
 # =============================================================================
 
 @app.post("/network/simulate/disconnect")
-async def disconnect_internet():
-    global INTERNET_AVAILABLE
+async def disconnect_internet() -> dict[str, Any]:
+    global internet_available
 
-    INTERNET_AVAILABLE = False
+    internet_available = False
 
-    add_event(
+    await emit_event(
         "WARN",
-        "WAN connection severed. OFFGRID P2P fallback active.",
+        "Internet connection simulated as OFFLINE. Mesh remains operational.",
     )
-
-    await broadcast_state()
 
     return network_snapshot()
 
 
 @app.post("/network/simulate/connect")
-async def connect_internet():
-    global INTERNET_AVAILABLE
+async def connect_internet() -> dict[str, Any]:
+    global internet_available
 
-    INTERNET_AVAILABLE = True
+    internet_available = True
 
-    add_event(
+    await emit_event(
         "SUCCESS",
-        "WAN gateway restored.",
+        "Internet connection restored.",
     )
-
-    await broadcast_state()
 
     return network_snapshot()
 
 
 # =============================================================================
-# Node failure simulation
+# Kill node
 # =============================================================================
 
-@app.post("/network/simulate/node/{node_id}/kill")
-async def kill_node(node_id: str):
-    if not registry.contains(node_id):
+@app.post("/node/{node_id}/kill")
+async def kill_node(
+    node_id: str,
+) -> dict[str, Any]:
+    node = registry.get(node_id)
+
+    if node is None:
         raise HTTPException(
             status_code=404,
-            detail="Node not found",
+            detail=f"Unknown node: {node_id}",
         )
 
-    registry.mark_offline(node_id)
+    if not node.is_online():
+        return network_snapshot()
 
+    registry.mark_offline(
+        node_id
+    )
+
+    # Force routing to ignore this node.
     add_event(
-        "ERROR",
-        f"{NODE_LABELS[node_id]} offline. Connection lost.",
+        "WARN",
+        f"{node_id} has been taken offline.",
         node_id,
     )
 
-    route = get_active_route()
+    new_route = get_active_route(
+        "NODE_A",
+        "NODE_E",
+    )
 
-    if route:
+    if new_route:
         add_event(
             "SUCCESS",
-            f"Route recalculated: {' → '.join(route)}",
+            (
+                "Route recalculated: "
+                + " → ".join(new_route)
+            ),
         )
     else:
         add_event(
@@ -793,40 +1021,45 @@ async def kill_node(node_id: str):
             "No route currently available to NODE_E.",
         )
 
-    await broadcast_state()
+    await broadcast_network_state()
 
     return network_snapshot()
 
 
-@app.post("/network/simulate/node/{node_id}/restore")
-async def restore_node(node_id: str):
-    if not registry.contains(node_id):
+# =============================================================================
+# Restore node
+# =============================================================================
+
+@app.post("/node/{node_id}/restore")
+async def restore_node(
+    node_id: str,
+) -> dict[str, Any]:
+    node = registry.get(node_id)
+
+    if node is None:
         raise HTTPException(
             status_code=404,
-            detail="Node not found",
+            detail=f"Unknown node: {node_id}",
         )
 
-    registry.mark_online(node_id)
+    registry.mark_online(
+        node_id
+    )
+
+    node.mark_seen()
 
     add_event(
         "SUCCESS",
-        (
-            f"{NODE_LABELS[node_id]} restored. "
-            f"Heartbeat re-established."
-        ),
+        f"{node_id} has been restored to the mesh.",
         node_id,
     )
 
     # -------------------------------------------------------------------------
-    # If this node is a pending-message destination, retry stored packets.
+    # Try store-and-forward queue.
     # -------------------------------------------------------------------------
 
     if delivery_manager is not None:
-        pending_before = (
-            delivery_manager.pending_messages(node_id)
-        )
-
-        if pending_before:
+        try:
             delivered_ids = (
                 delivery_manager.retry_pending(
                     node_id
@@ -841,21 +1074,38 @@ async def restore_node(node_id: str):
                 add_event(
                     "SUCCESS",
                     (
-                        f"Stored message {message_id} "
-                        f"forwarded to {node_id}."
+                        f"Queued message "
+                        f"{message_id} delivered "
+                        f"after {node_id} returned."
                     ),
                     node_id,
                 )
 
-    route = get_active_route()
+        except Exception as exc:
+            add_event(
+                "WARN",
+                (
+                    f"Retry processing for "
+                    f"{node_id} failed: {exc}"
+                ),
+                node_id,
+            )
+
+    route = get_active_route(
+        "NODE_A",
+        "NODE_E",
+    )
 
     if route:
         add_event(
-            "SUCCESS",
-            f"Route restored: {' → '.join(route)}",
+            "INFO",
+            (
+                "Current route: "
+                + " → ".join(route)
+            ),
         )
 
-    await broadcast_state()
+    await broadcast_network_state()
 
     return network_snapshot()
 
@@ -864,28 +1114,16 @@ async def restore_node(node_id: str):
 # Reset
 # =============================================================================
 
-@app.post("/network/reset")
-async def reset_network():
-    global INTERNET_AVAILABLE
-
-    INTERNET_AVAILABLE = False
-
-    EVENTS.clear()
-
+@app.post("/reset")
+async def reset_network() -> dict[str, Any]:
     initialize_network()
-
-    # Reinitialize pending messaging state as well.
-    add_event(
-        "INFO",
-        "Network topology reset to initial state.",
-    )
 
     add_event(
         "SUCCESS",
-        "Primary route restored: A → B → C → D → E",
+        "Network reset to healthy demo state.",
     )
 
-    await broadcast_state()
+    await broadcast_network_state()
 
     return network_snapshot()
 
@@ -895,13 +1133,17 @@ async def reset_network():
 # =============================================================================
 
 @app.websocket("/ws/network")
-async def network_websocket(websocket: WebSocket):
+async def websocket_network(
+    websocket: WebSocket,
+) -> None:
     await websocket.accept()
 
-    connected_clients.add(websocket)
+    websocket_clients.add(
+        websocket
+    )
 
     try:
-        # Immediately send current state.
+        # Send current state immediately.
         await websocket.send_json(
             {
                 "type": "NETWORK_STATE",
@@ -910,17 +1152,44 @@ async def network_websocket(websocket: WebSocket):
         )
 
         while True:
-            message = await websocket.receive_text()
+            try:
+                message = await websocket.receive_text()
 
-            if message == "ping":
-                await websocket.send_json(
-                    {
-                        "type": "PONG",
-                    }
-                )
+                # Optional heartbeat from frontend/client.
+                if message.upper() == "PING":
+                    await websocket.send_json(
+                        {
+                            "type": "PONG",
+                        }
+                    )
+
+            except WebSocketDisconnect:
+                break
 
     except WebSocketDisconnect:
-        connected_clients.discard(websocket)
+        pass
 
-    except Exception:
-        connected_clients.discard(websocket)
+    except Exception as exc:
+        print(
+            f"WebSocket error: {exc}"
+        )
+
+    finally:
+        websocket_clients.discard(
+            websocket
+        )
+
+
+# =============================================================================
+# Development entry point
+# =============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "backend.api.app:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+    )
