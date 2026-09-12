@@ -1,12 +1,9 @@
 'use client';
 
 import React, { useState } from 'react';
-import { TransferState, MeshNode } from '@/types/network';
+import { MeshNode } from '@/types/network';
 
 interface ActivityBarProps {
-  onSendMessage: () => void;
-  onSendFile: () => void;
-  transferState: TransferState;
   nodes: MeshNode[];
   liveMode: boolean;
   sendingMessage: boolean;
@@ -14,16 +11,11 @@ interface ActivityBarProps {
 }
 
 export const ActivityBar: React.FC<ActivityBarProps> = ({
-  onSendMessage,
-  onSendFile,
-  transferState,
   nodes,
   liveMode,
   sendingMessage,
   onSendCustomMessage
 }) => {
-  const { isTransferring, transferType, transferProgress, messageQueue } = transferState;
-
   const [customText, setCustomText] = useState('');
   const [customDest, setCustomDest] = useState('NODE_B');
   const [customStatus, setCustomStatus] = useState<string | null>(null);
@@ -72,46 +64,17 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
         <p className="text-zinc-400 text-xs mt-1">
           {liveMode
             ? 'Messages below are transmitted as real UDP packets to the connected OFFGRID node.'
-            : 'Inject encrypted text broadcasts or multi-chunk binary files across the decentralized mesh.'}
+            : 'Requires REAL LAN MODE — set NEXT_PUBLIC_OFFGRID_API to your node API (e.g. http://localhost:8001) and restart the dashboard.'}
         </p>
-
-        {/* Live Transfer Status Bar */}
-        <div className="mt-5 p-4 rounded bg-zinc-950/80 border border-zinc-800/80 space-y-3">
-          <div className="flex items-center justify-between text-xs">
-            <span className="text-zinc-300 font-medium">
-              {sendingMessage
-                ? 'Transmitting P2P Message...'
-                : isTransferring
-                  ? `Transmitting ${transferType === 'FILE' ? 'Binary File Chunks' : 'P2P Message'}...`
-                  : 'Radio Transmitter Idle'}
-            </span>
-            <span className="text-zinc-400 font-semibold">
-              {sendingMessage ? '—' : `${transferProgress}%`}
-            </span>
-          </div>
-
-          {/* Clean Progress Track */}
-          <div className="w-full h-2 bg-zinc-900 rounded-full border border-zinc-800 overflow-hidden">
-            <div
-              className="h-full bg-zinc-100 transition-all duration-200 rounded-full"
-              style={{ width: `${sendingMessage ? 100 : transferProgress}%` }}
-            />
-          </div>
-
-          <div className="flex items-center justify-between text-[11px] text-zinc-500 pt-1">
-            <span>In-flight Queue: {sendingMessage ? 1 : messageQueue} packet(s)</span>
-            <span>Protocols: {liveMode ? 'UDP / OFFGRID Mesh' : 'E2EE / Ed25519 Signed'}</span>
-          </div>
-        </div>
       </div>
 
-      {/* REAL MODE: Custom Message Composer */}
+      {/* Custom Message Composer */}
       <div className="p-5 rounded-lg bg-zinc-900/40 border border-zinc-800">
         <div className="font-bold text-zinc-100 text-sm">Custom Message</div>
         <p className="text-zinc-400 text-xs mt-1.5 leading-relaxed">
           {liveMode
             ? 'Type any text and send it from this node to a discovered peer over the real LAN.'
-            : 'Requires REAL LAN MODE — set NEXT_PUBLIC_OFFGRID_API to your node API (e.g. http://localhost:8001) and restart the dashboard.'}
+            : 'The dashboard could not reach a live node. Start the node with --api-port and set NEXT_PUBLIC_OFFGRID_API.'}
         </p>
 
         <div className="mt-4 space-y-3">
@@ -167,71 +130,14 @@ export const ActivityBar: React.FC<ActivityBarProps> = ({
         </div>
       </div>
 
-      {/* Action Cards (simulation mode) */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-        {/* Send Message */}
-        <div className="p-5 rounded-lg bg-zinc-900/40 border border-zinc-800 flex flex-col justify-between">
-          <div>
-            <div className="font-bold text-zinc-100 text-sm">Encrypted Message</div>
-            <p className="text-zinc-400 text-xs mt-1.5 leading-relaxed">
-              Injects a 128-byte broadcast telemetry frame from Node A (Origin) to Node E (Target).
-            </p>
-          </div>
-          <div className="mt-5">
-            <button
-              onClick={onSendMessage}
-              disabled={isTransferring}
-              className={`w-full py-2.5 rounded text-xs font-semibold border transition-all ${
-                isTransferring
-                  ? 'bg-zinc-900 border-zinc-800 text-zinc-600 cursor-not-allowed'
-                  : 'bg-zinc-800 border-zinc-700 text-zinc-100 hover:bg-zinc-700 cursor-pointer'
-              }`}
-            >
-              {isTransferring && transferType === 'MESSAGE' ? 'Broadcasting...' : 'Send P2P Message'}
-            </button>
-          </div>
-        </div>
-
-        {/* Send File */}
-        <div className="p-5 rounded-lg bg-zinc-900/40 border border-zinc-800 flex flex-col justify-between">
-          <div>
-            <div className="font-bold text-zinc-100 text-sm">Chunked File Transfer</div>
-            <p className="text-zinc-400 text-xs mt-1.5 leading-relaxed">
-              Transmits binary data with SHA-256 chunk validation and Store & Forward fallback caching.
-            </p>
-          </div>
-          <div className="mt-5">
-            <button
-              onClick={onSendFile}
-              disabled={isTransferring}
-              className={`w-full py-2.5 rounded text-xs font-semibold border transition-all ${
-                isTransferring
-                  ? 'bg-zinc-900 border-zinc-800 text-zinc-600 cursor-not-allowed'
-                  : 'bg-zinc-800 border-zinc-700 text-zinc-100 hover:bg-zinc-700 cursor-pointer'
-              }`}
-            >
-              {isTransferring && transferType === 'FILE' ? 'Transmitting Chunks...' : 'Send File Chunk'}
-            </button>
-          </div>
-        </div>
-      </div>
-
       {/* Delay-Tolerant Networking (DTN) Note */}
-      <div className="p-4 rounded-lg bg-zinc-900/30 border border-zinc-800/80 text-xs text-zinc-400 flex items-center justify-between">
-        <div>
-          <span className="font-semibold text-zinc-200">Delay-Tolerant Networking (DTN):</span>
-          <span className="ml-1 text-zinc-400">
-            If the target destination is offline, relay nodes hold packets in local RAM and forward upon reconnection.
-          </span>
-        </div>
-        <span className="text-amber-400 font-medium shrink-0 ml-4">
-          Store & Forward Queue: {metrics_queue(nodes)} pkt(s)
+      <div className="p-4 rounded-lg bg-zinc-900/30 border border-zinc-800/80 text-xs text-zinc-400">
+        <span className="font-semibold text-zinc-200">Delay-Tolerant Networking (DTN):</span>
+        <span className="ml-1">
+          If the destination is offline, relay nodes hold packets in local RAM and forward upon reconnection.
+          Status of every message appears live in the Message Tracker on the Topology tab.
         </span>
       </div>
     </div>
   );
 };
-
-function metrics_queue(nodes: MeshNode[]): number {
-  return nodes.reduce((acc, n) => acc + (n.storedPacketsCount || 0), 0);
-}

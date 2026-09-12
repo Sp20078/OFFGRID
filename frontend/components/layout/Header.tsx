@@ -7,18 +7,14 @@ export type NavTab = 'network' | 'transfers' | 'logs';
 interface HeaderProps {
   activeTab: NavTab;
   onTabChange: (tab: NavTab) => void;
-  internetOnline: boolean;
-  onToggleInternet: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   activeTab,
-  onTabChange,
-  internetOnline,
-  onToggleInternet
+  onTabChange
 }) => {
   const tabs: { id: NavTab; label: string }[] = [
-    { id: 'network', label: 'Topology & Simulator' },
+    { id: 'network', label: 'Topology & Live Status' },
     { id: 'transfers', label: 'Transfers' },
     { id: 'logs', label: 'Audit Logs' }
   ];
@@ -61,19 +57,6 @@ export const Header: React.FC<HeaderProps> = ({
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
           <span className="text-[11px] text-zinc-300">P2P Core Active</span>
         </div>
-
-        <button
-          onClick={onToggleInternet}
-          title="Toggle WAN Gateway connection"
-          className={`flex items-center space-x-1.5 px-2.5 py-1 rounded text-[11px] font-medium border transition-all cursor-pointer ${
-            internetOnline
-              ? 'bg-emerald-950/30 border-emerald-500/40 text-emerald-400 hover:bg-emerald-900/30'
-              : 'bg-amber-950/30 border-amber-500/40 text-amber-300 hover:bg-amber-900/30'
-          }`}
-        >
-          <span className={`w-1.5 h-1.5 rounded-full ${internetOnline ? 'bg-emerald-400' : 'bg-amber-400'}`} />
-          <span>WAN: {internetOnline ? 'ONLINE' : 'OFFLINE'}</span>
-        </button>
       </div>
     </header>
   );

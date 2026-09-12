@@ -5,7 +5,6 @@ import { useNetworkState } from '@/hooks/useNetworkState';
 import { Header, NavTab } from '@/components/layout/Header';
 import { NetworkGraph } from '@/components/graph/NetworkGraph';
 import { NodeInspector } from '@/components/inspector/NodeInspector';
-import { SimulatorDeck } from '@/components/simulator/SimulatorDeck';
 import { ActivityBar } from '@/components/activity/ActivityBar';
 import { EventStream } from '@/components/telemetry/EventStream';
 import { LiveStatus } from '@/components/live/LiveStatus';
@@ -18,26 +17,18 @@ export default function Home() {
     activeRoute,
     selectedNode,
     setSelectedNodeId,
-    internetOnline,
     logs,
     metrics,
-    transferState,
     liveMode,
     sendingMessage,
     sendMessageToNode,
-    messageEvents,
-    actions
+    messageEvents
   } = useNetworkState();
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col font-mono select-none">
       {/* Top Header with Navigation Tabs */}
-      <Header
-        activeTab={activeTab}
-        onTabChange={setActiveTab}
-        internetOnline={internetOnline}
-        onToggleInternet={actions.toggleInternet}
-      />
+      <Header activeTab={activeTab} onTabChange={setActiveTab} />
 
       {/* Main Content Area */}
       <main className="flex-1 p-4 md:p-6 max-w-7xl w-full mx-auto">
@@ -62,28 +53,14 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Bottom Row: Chaos Simulator Controls (Directly updates topology above) */}
-            <SimulatorDeck
-              nodes={nodes}
-              activeRoute={activeRoute}
-              internetOnline={internetOnline}
-              onToggleInternet={actions.toggleInternet}
-              onKillNode={actions.killNode}
-              onRestoreNode={actions.restoreNode}
-              onResetNetwork={actions.resetNetwork}
-            />
-
             {/* Live node activation + message tracker (real mode) */}
             <LiveStatus nodes={nodes} messageEvents={messageEvents} liveMode={liveMode} />
           </div>
         )}
 
-        {/* VIEW 2: TRANSFERS (P2P Message & File Chunk Injection) */}
+        {/* VIEW 2: TRANSFERS (real P2P message composer) */}
         {activeTab === 'transfers' && (
           <ActivityBar
-            onSendMessage={() => actions.sendTransfer('MESSAGE')}
-            onSendFile={() => actions.sendTransfer('FILE')}
-            transferState={transferState}
             nodes={nodes}
             liveMode={liveMode}
             sendingMessage={sendingMessage}
